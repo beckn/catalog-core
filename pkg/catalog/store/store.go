@@ -240,6 +240,11 @@ type fileEnvelope struct {
 // file applied -- for each of catalogIDs that has prior publish history.
 // A requested catalogId absent from the result has none: the caller
 // starts a fresh baseline for it.
+//
+// A retired catalogId is present in the result with CatalogState.Retired
+// set and no content (Catalog, BaselineFile and ChangeFiles are empty).
+// Presence in the result therefore does not by itself mean there is
+// content to diff against; check Retired, or Catalog, for that.
 func (s *Store) LoadCatalogs(ctx context.Context, catalogIDs []string) (map[string]CatalogState, error) {
 	s.log.DebugContext(ctx, "catalogstore: LoadCatalogs", "requested", len(catalogIDs))
 	entries, _, err := s.readIndexEntries(ctx)
