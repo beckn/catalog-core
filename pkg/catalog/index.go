@@ -158,9 +158,16 @@ func FindCatalog(idx Index, catalogID string) (CatalogEntry, bool) {
 // DroppedEntry records one index entry FetchIndex declined to trust: its
 // self-signature didn't verify (or it didn't parse at all), so it is
 // reported rather than silently missing from the result.
+//
+// Transient is true when the entry could not be verified for a reason that
+// may clear on its own (the key source could not be reached), as opposed to
+// a definitive verdict (malformed, unsigned, unknown key, bad signature). A
+// caller that skips unchanged indexes by conditional GET must not treat a
+// poll with a transiently dropped entry as having seen the whole index.
 type DroppedEntry struct {
 	CatalogID string
 	Reason    string
+	Transient bool
 }
 
 // IndexConditions are the conditional-GET validators a caller may have
