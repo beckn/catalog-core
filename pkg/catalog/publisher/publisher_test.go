@@ -685,24 +685,32 @@ func TestPublish_CompactionThreshold_NeverForcesBaselineOnNoOp(t *testing.T) {
 	}
 }
 
+// TestPublish_Retire_ProducesTombstone: retiring a published catalog signs
+// a tombstone -- retiredAt, no files, no isActive. (Retiring an id that was
+// never published used to do the same at entryVersion 1; that is now
+// refused, see TestIdentity_RetireUnknown in identity_rules_test.go.)
 func TestPublish_Retire_ProducesTombstone(t *testing.T) {
 	priv, keyID := testSigningKey(t)
+	baseline := catalog.FileEntry{Version: 1, URL: "https://example.test/catalogs/CAT-OLD.v1.json", Digest: "sha-256:00", Size: 10}
 	result, err := Publish(context.Background(), Params{
-		Catalogs:   []Submission{{CatalogID: "CAT-OLD", Directives: PublishDirectives{Retire: true}}},
+		Catalogs: []Submission{{CatalogID: "CAT-OLD", Directives: PublishDirectives{Retire: true}}},
+		PriorState: map[string]store.CatalogState{
+			"CAT-OLD": {Catalog: validCatalogJSON("CAT-OLD"), BaselineFile: &baseline, EntryVersion: 1, IsActive: true},
+		},
 		SigningKey: priv, KeyID: keyID, Domain: "example.test",
 	})
 	if err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 
-	if len(result.Publish.Retirements) != 1 {
-		t.Fatalf("expected 1 tombstone entry, got %d", len(result.Publish.Retirements))
+	if len(result.Errors) != 0 || len(result.Publish.Retirements) != 1 {
+		t.Fatalf("expected 1 tombstone entry and no errors, got %d and %+v", len(result.Publish.Retirements), result.Errors)
 	}
 	var entry catalog.CatalogEntry
 	if err := json.Unmarshal(result.Publish.Retirements[0].SignedEntry, &entry); err != nil {
 		t.Fatalf("parsing entry: %v", err)
 	}
-	if entry.CatalogID != "CAT-OLD" || !entry.IsRetired() || entry.EntryVersion != 1 {
+	if entry.CatalogID != "CAT-OLD" || !entry.IsRetired() || entry.EntryVersion != 2 {
 		t.Errorf("unexpected tombstone: %+v", entry)
 	}
 	if entry.Baseline.URL != "" || len(entry.Changes) != 0 || entry.IsActive != nil {

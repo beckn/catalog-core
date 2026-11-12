@@ -432,6 +432,15 @@ func sharesFilesWithLiveCatalog(prior store.CatalogState) (string, bool) {
 func (p Params) retireOne(ctx context.Context, id string, now time.Time, fileNextUpdate time.Time, result *Result) error {
 	log := p.logger()
 	prior := p.PriorState[id]
+	if !prior.Known() {
+		reason := fmt.Sprintf("catalog not found: catalogId %q is not in the catalog index, so there is nothing to retire", id)
+		if id == "" {
+			reason = "catalog not found: missing catalogId"
+		}
+		log.WarnContext(ctx, "catalog/publisher: retire rejected", "catalogId", id, "stage", "retire", "reason", reason)
+		result.Errors = append(result.Errors, PublishError{CatalogID: id, Stage: "retire", Reason: reason})
+		return nil
+	}
 	// Retirement is one-way and happens once (NFH-014 CON-TBD-05): the
 	// tombstone already in the index is authoritative. Signing a second
 	// one would move retiredAt, so it no longer matches the final
