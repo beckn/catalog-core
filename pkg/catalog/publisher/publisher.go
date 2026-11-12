@@ -446,6 +446,9 @@ func Publish(ctx context.Context, p Params) (Result, error) {
 //     immutable files (CON-TBD-23).
 //   - A catalog whose published content cannot be read back cannot be
 //     diffed; only an explicit ForceBaseline (or a retire) moves it on.
+//     One whose index entry itself cannot be read cannot be published at
+//     all: a forced baseline would restart its entryVersion and overwrite
+//     its files.
 //   - A catalogId that has no index entry yet must be usable as a file
 //     name and URL (store.ValidateCatalogID), and its file names must not
 //     already belong to another catalogId, in the index or earlier in this
@@ -463,6 +466,9 @@ func admit(sub Submission, prior store.CatalogState, claimed map[string]string) 
 	id := sub.CatalogID
 	if prior.Retired {
 		return "validate", fmt.Errorf("catalogId %q is retired and cannot be published again (NFH-014 CON-TBD-26); publish this catalog under a new catalogId", id)
+	}
+	if prior.EntryMalformed {
+		return "load", fmt.Errorf("the index entry of catalogId %q cannot be read, so neither its entryVersion nor its files are known (%s); it cannot be published until the index entry is repaired", id, prior.Unreadable)
 	}
 	if prior.Unreadable != "" && !sub.Directives.ForceBaseline {
 		return "load", fmt.Errorf("the published content of catalogId %q cannot be read back, so there is nothing to compare this submission with (%s); publish it with forceBaseline to start from a new baseline, or retire it", id, prior.Unreadable)
@@ -533,6 +539,12 @@ func (p Params) retireOne(ctx context.Context, id string, now time.Time, fileNex
 		result.Errors = append(result.Errors, PublishError{CatalogID: id, Stage: "retire", Reason: reason})
 		return nil
 	}
+	if prior.EntryMalformed {
+		reason := fmt.Sprintf("the index entry of catalogId %q cannot be read, so the entryVersion its tombstone must continue from is not known (%s); it cannot be retired until the index entry is repaired", id, prior.Unreadable)
+		log.WarnContext(ctx, "catalog/publisher: retire rejected", "catalogId", id, "stage", "retire", "reason", reason)
+		result.Errors = append(result.Errors, PublishError{CatalogID: id, Stage: "retire", Reason: reason})
+		return nil
+	}
 	// Retirement is one-way and happens once (NFH-014 CON-TBD-05): the
 	// tombstone already in the index is authoritative. Signing a second
 	// one would move retiredAt, so it no longer matches the final
@@ -540,22 +552,6 @@ func (p Params) retireOne(ctx context.Context, id string, now time.Time, fileNex
 	if prior.Retired {
 		return p.recheckRetired(ctx, id, prior, fileNextUpdate, result)
 	}
-	retiredAt := now.Format(time.RFC3339Nano)
-	raw, err := p.signEntry(catalog.CatalogEntry{
-		CatalogID:    id,
-		EntryVersion: prior.EntryVersion + 1,
-		CatalogType:  prior.CatalogType,
-		NetworkIDs:   prior.NetworkIds,
-		SchemaTypes:  prior.SchemaTypes,
-		RetiredAt:    retiredAt,
-	})
-	if err != nil {
-		log.ErrorContext(ctx, "catalog/publisher: signing tombstone failed", "catalogId", id, "error", err)
-		return fmt.Errorf("catalog/publisher: signing tombstone %q: %w", id, err)
-	}
-	log.DebugContext(ctx, "catalog/publisher: catalog retired", "catalogId", id, "entryVersion", prior.EntryVersion+1, "latestPublished", prior.LatestPublished)
-	update := store.CatalogUpdate{CatalogID: id, SignedEntry: raw}
-	report := RetireReport{CatalogID: id, EntryVersion: prior.EntryVersion + 1, RetiredAt: retiredAt}
 
 	// CON-TBD-38: a catalog that had "latest" published needs one final
 	// write to that same stable URL, populating CatalogFileDoc.retiredAt
@@ -578,30 +574,70 @@ func (p Params) retireOne(ctx context.Context, id string, now time.Time, fileNex
 	} else {
 		targets = p.retireLatestTargets(prior)
 	}
-	if len(targets) > 0 {
-		if prior.Catalog == nil {
-			log.WarnContext(ctx, "catalog/publisher: cannot write final latest tombstone, prior catalog content missing", "catalogId", id)
-			result.Errors = append(result.Errors, PublishError{
-				CatalogID: id, Stage: "retire",
-				Reason: "LatestPublished is set but PriorState.Catalog is empty; cannot write the final \"latest\" tombstone",
-			})
+	// What the final file carries: the catalog as last published. When
+	// that cannot be read back (CatalogState.Unreadable), the newest
+	// readable "latest" file stands in for it. With neither, there is no
+	// CatalogFile to put retiredAt on, and the retire is refused here,
+	// before anything is signed: a tombstone in the index next to a
+	// "latest" that still says live is the state this write exists to
+	// prevent, and a retire that reports an error must not have happened.
+	finalCatalog, finalVersion := prior.Catalog, currentVersion(prior)
+	if len(targets) > 0 && finalCatalog == nil {
+		if source := newestReadableLatest(prior.StoredLatest); source != nil {
+			finalCatalog, finalVersion = source.Catalog, source.Version
 		} else {
-			content, err := p.signCatalogFile(id, currentVersion(prior), fileNextUpdate, prior.Catalog, &now)
-			if err != nil {
-				log.ErrorContext(ctx, "catalog/publisher: signing final latest tombstone failed", "catalogId", id, "error", err)
-				return fmt.Errorf("catalog/publisher: signing final \"latest\" tombstone %q: %w", id, err)
+			reason := fmt.Sprintf("catalogId %q has a \"latest\" file that must be given a final copy carrying retiredAt, but neither its published content nor that file can be read back, so there is nothing to build the final copy from; publish it with forceBaseline first, then retire it", id)
+			log.WarnContext(ctx, "catalog/publisher: retire rejected", "catalogId", id, "stage", "retire", "reason", reason)
+			result.Errors = append(result.Errors, PublishError{CatalogID: id, Stage: "retire", Reason: reason})
+			return nil
+		}
+	}
+
+	retiredAt := now.Format(time.RFC3339Nano)
+	raw, err := p.signEntry(catalog.CatalogEntry{
+		CatalogID:    id,
+		EntryVersion: prior.EntryVersion + 1,
+		CatalogType:  prior.CatalogType,
+		NetworkIDs:   prior.NetworkIds,
+		SchemaTypes:  prior.SchemaTypes,
+		RetiredAt:    retiredAt,
+	})
+	if err != nil {
+		log.ErrorContext(ctx, "catalog/publisher: signing tombstone failed", "catalogId", id, "error", err)
+		return fmt.Errorf("catalog/publisher: signing tombstone %q: %w", id, err)
+	}
+	log.DebugContext(ctx, "catalog/publisher: catalog retired", "catalogId", id, "entryVersion", prior.EntryVersion+1, "latestPublished", prior.LatestPublished)
+	update := store.CatalogUpdate{CatalogID: id, SignedEntry: raw}
+	report := RetireReport{CatalogID: id, EntryVersion: prior.EntryVersion + 1, RetiredAt: retiredAt}
+
+	if len(targets) > 0 {
+		content, err := p.signCatalogFile(id, finalVersion, fileNextUpdate, finalCatalog, &now)
+		if err != nil {
+			log.ErrorContext(ctx, "catalog/publisher: signing final latest tombstone failed", "catalogId", id, "error", err)
+			return fmt.Errorf("catalog/publisher: signing final \"latest\" tombstone %q: %w", id, err)
+		}
+		for _, compressed := range targets {
+			if err := p.addRetiredLatest(&update, &report, id, finalVersion, content, compressed); err != nil {
+				return err
 			}
-			for _, compressed := range targets {
-				if err := p.addRetiredLatest(&update, &report, id, currentVersion(prior), content, compressed); err != nil {
-					return err
-				}
-				log.DebugContext(ctx, "catalog/publisher: wrote final latest tombstone", "catalogId", id, "compressed", compressed)
-			}
+			log.DebugContext(ctx, "catalog/publisher: wrote final latest tombstone", "catalogId", id, "compressed", compressed)
 		}
 	}
 	result.Publish.Retirements = append(result.Publish.Retirements, update)
 	result.Retired = append(result.Retired, report)
 	return nil
+}
+
+// newestReadableLatest returns the stored "latest" file with the highest
+// version that parses and carries a catalog, or nil.
+func newestReadableLatest(stored []store.LatestFileState) *store.LatestFileState {
+	var source *store.LatestFileState
+	for i := range stored {
+		if st := &stored[i]; st.Readable && len(st.Catalog) > 0 && (source == nil || st.Version > source.Version) {
+			source = st
+		}
+	}
+	return source
 }
 
 // retireLatestTargets lists the "latest" names (compressed or not) that
@@ -662,12 +698,7 @@ func (p Params) recheckRetired(ctx context.Context, id string, prior store.Catal
 
 	// Content to rebuild a missing tombstone from: whatever readable
 	// "latest" file there is (a retired state carries no catalog itself).
-	var source *store.LatestFileState
-	for i := range prior.StoredLatest {
-		if st := &prior.StoredLatest[i]; st.Readable && len(st.Catalog) > 0 && (source == nil || st.Version > source.Version) {
-			source = st
-		}
-	}
+	source := newestReadableLatest(prior.StoredLatest)
 	for _, st := range prior.StoredLatest {
 		if st.Readable && st.RetiredAt != nil {
 			fe, _, err := p.buildLatestFileEntry(id, st.Version, st.Content, st.Compressed)
@@ -766,6 +797,7 @@ func (p Params) publishOne(ctx context.Context, sub Submission, prior store.Cata
 	forceBaseline := sub.Directives.ForceBaseline
 	var diff catalog.CatalogDiff
 	var changeCatalog json.RawMessage
+	var attributesRemoved []string
 	contentChanged := true
 	if hasPrior && !forceBaseline {
 		var err error
@@ -773,18 +805,26 @@ func (p Params) publishOne(ctx context.Context, sub Submission, prior store.Cata
 		if err != nil {
 			return outcome{}, catalog.CatalogEntry{}, err
 		}
-		contentChanged = !diff.Resources.IsEmpty() || !diff.Offers.IsEmpty() || changeCatalog != nil
+		// A change file can set a top-level attribute but not remove one
+		// (see catalog.RemovedAttributes). A submission that drops one is
+		// a content change that only a baseline can publish.
+		if attributesRemoved, err = catalog.RemovedAttributes(prior.Catalog, sub.Catalog); err != nil {
+			return outcome{}, catalog.CatalogEntry{}, err
+		}
+		contentChanged = !diff.Resources.IsEmpty() || !diff.Offers.IsEmpty() || changeCatalog != nil || len(attributesRemoved) > 0
 		log.DebugContext(ctx, "catalog/publisher: diffed against prior state", "catalogId", sub.CatalogID,
 			"upserts", len(diff.Resources.Upserts)+len(diff.Offers.Upserts), "removals", len(diff.Resources.Removals)+len(diff.Offers.Removals),
 			"attributesChanged", changeCatalog != nil, "contentChanged", contentChanged)
 	}
 
 	compactionDue := hasPrior && !forceBaseline && contentChanged && p.compactionDue(ctx, sub.CatalogID, prior)
-	if !hasPrior || forceBaseline || compactionDue {
+	if !hasPrior || forceBaseline || compactionDue || len(attributesRemoved) > 0 {
 		reason := "no prior state"
 		switch {
 		case forceBaseline:
 			reason = "ForceBaseline"
+		case len(attributesRemoved) > 0:
+			reason = "catalog attributes removed (" + strings.Join(attributesRemoved, ", ") + "), which a change file cannot express"
 		case compactionDue:
 			reason = "compaction threshold reached"
 		}

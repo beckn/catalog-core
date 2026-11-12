@@ -91,6 +91,12 @@ func TestOnConditionalStore(t *testing.T) {
 		{"Identity_IndexThatAlreadySharesFiles", TestIdentity_IndexThatAlreadySharesFiles},
 		{"Identity_UnreadableCatalogDoesNotPoisonTheBatch", TestIdentity_UnreadableCatalogDoesNotPoisonTheBatch},
 		{"Identity_LiveEntryWithoutBaseline", TestIdentity_LiveEntryWithoutBaseline},
+		{"DroppedAttribute_PublishedContentMatchesSubmission", TestDroppedAttribute_PublishedContentMatchesSubmission},
+		{"Retire_UnreadableCatalog_BuildsFinalLatestFromStoredFile", TestRetire_UnreadableCatalog_BuildsFinalLatestFromStoredFile},
+		{"Retire_UnreadableCatalogAndLatest_IsRefusedWithNothingSigned", TestRetire_UnreadableCatalogAndLatest_IsRefusedWithNothingSigned},
+		{"ForceBaseline_UnreadableCatalog_KeepsLatestName", TestForceBaseline_UnreadableCatalog_KeepsLatestName},
+		{"MalformedIndexEntry_IsRefusedPerCatalog", TestMalformedIndexEntry_IsRefusedPerCatalog},
+		{"SupersededChangeFiles_AreNotAppliedOverTheNewBaseline", TestSupersededChangeFiles_AreNotAppliedOverTheNewBaseline},
 	} {
 		t.Run(tc.name, tc.run)
 	}
