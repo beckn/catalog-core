@@ -95,12 +95,16 @@ func TestLoad_NoPriorIndex_ReturnsEmptyResult(t *testing.T) {
 	}
 }
 
-func TestLoad_RetiredEntry_HasNoPublishableState(t *testing.T) {
+// TestLoad_RetiredEntry_ReturnsTombstoneState: a retired catalog has no
+// publishable content, but its tombstone's own metadata is still returned
+// (flagged Retired) so a caller can tell it apart from a catalog that
+// never existed and keep EntryVersion's lineage going.
+func TestLoad_RetiredEntry_ReturnsTombstoneState(t *testing.T) {
 	blobs := newFakeBlobStore()
 	s := store.New(blobs)
 	ctx := context.Background()
 
-	entry := json.RawMessage(`{"catalogId":"example.test/CAT-1","entryVersion":2,"catalogType":"REGULAR","retiredAt":"2026-01-01T00:00:00Z"}`)
+	entry := json.RawMessage(`{"catalogId":"example.test/CAT-1","entryVersion":2,"catalogType":"REGULAR","networkIds":["ion.example"],"retiredAt":"2026-01-01T00:00:00Z"}`)
 	if err := s.Publish(ctx, store.PublishRequest{
 		NodeID:      "example.test",
 		Retirements: []store.CatalogUpdate{{CatalogID: "example.test/CAT-1", SignedEntry: entry}},
@@ -108,12 +112,22 @@ func TestLoad_RetiredEntry_HasNoPublishableState(t *testing.T) {
 		t.Fatalf("Publish: %v", err)
 	}
 
-	states, err := s.LoadCatalogs(ctx, []string{"example.test/CAT-1"})
+	states, err := s.LoadCatalogs(ctx, []string{"example.test/CAT-1", "example.test/NEVER-EXISTED"})
 	if err != nil {
 		t.Fatalf("LoadCatalogs: %v", err)
 	}
-	if _, ok := states["example.test/CAT-1"]; ok {
-		t.Error("expected no state for a retired catalog")
+	state, ok := states["example.test/CAT-1"]
+	if !ok {
+		t.Fatal("expected a tombstone state for a retired catalog")
+	}
+	if !state.Retired || state.EntryVersion != 2 || state.CatalogType != "REGULAR" || len(state.NetworkIds) != 1 {
+		t.Errorf("tombstone state = %+v, want Retired with entryVersion 2 and the tombstone's metadata", state)
+	}
+	if state.Catalog != nil || state.BaselineFile != nil || len(state.ChangeFiles) != 0 || state.LatestPublished {
+		t.Errorf("tombstone state must carry no publishable content, got %+v", state)
+	}
+	if _, ok := states["example.test/NEVER-EXISTED"]; ok {
+		t.Error("expected no state for a catalog that is not in the index")
 	}
 }
 

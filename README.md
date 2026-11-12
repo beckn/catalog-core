@@ -390,6 +390,7 @@ type CatalogState struct {
     Dependencies    []catalog.MasterDependency
     CrawlHint       string
     LatestPublished bool
+    Retired         bool // entry is already a tombstone; only EntryVersion/CatalogType/NetworkIds/SchemaTypes are set
 }
 
 type FileWrite struct {

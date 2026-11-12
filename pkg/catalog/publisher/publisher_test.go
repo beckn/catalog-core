@@ -754,6 +754,63 @@ func TestPublish_RetireWithPriorState_KeepsMetadataAndBumpsEntryVersion(t *testi
 	}
 }
 
+// TestPublish_RetireAlreadyRetired_IsNoOp: retiring a catalog whose index
+// entry is already a tombstone must not sign another one -- that would
+// move retiredAt and, before store.CatalogState carried Retired, reset
+// EntryVersion to 1 (a regression a DS must treat as a possible rollback,
+// NFH-014 CON-TBD-03/CON-TBD-11).
+func TestPublish_RetireAlreadyRetired_IsNoOp(t *testing.T) {
+	priv, keyID := testSigningKey(t)
+	result, err := Publish(context.Background(), Params{
+		Catalogs: []Submission{{CatalogID: "CAT-OLD", Directives: PublishDirectives{Retire: true}}},
+		PriorState: map[string]store.CatalogState{
+			"CAT-OLD": {EntryVersion: 6, CatalogType: "REGULAR", Retired: true},
+		},
+		SigningKey: priv, KeyID: keyID, Domain: "example.test",
+	})
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if len(result.Publish.Retirements) != 0 || len(result.Publish.Updates) != 0 {
+		t.Errorf("expected nothing to be written for an already-retired catalog, got Retirements=%d Updates=%d",
+			len(result.Publish.Retirements), len(result.Publish.Updates))
+	}
+	if len(result.Errors) != 0 {
+		t.Errorf("a repeat retire is not an error, got %+v", result.Errors)
+	}
+}
+
+// TestPublish_SubmissionForRetiredCatalog_ContinuesEntryVersion: publishing
+// content under a retired catalogId still starts a fresh baseline (there is
+// no content to diff against), but EntryVersion continues from the
+// tombstone's rather than regressing to 1.
+func TestPublish_SubmissionForRetiredCatalog_ContinuesEntryVersion(t *testing.T) {
+	priv, keyID := testSigningKey(t)
+	result, err := Publish(context.Background(), Params{
+		Catalogs: []Submission{{CatalogID: "CAT-OLD", Catalog: mustCatalogWithItems("CAT-OLD", "ITEM-1")}},
+		PriorState: map[string]store.CatalogState{
+			"CAT-OLD": {EntryVersion: 6, CatalogType: "REGULAR", Retired: true},
+		},
+		SigningKey: priv, KeyID: keyID, Domain: "example.test",
+	})
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if len(result.Errors) != 0 || len(result.Publish.Updates) != 1 {
+		t.Fatalf("expected one published update, got Updates=%d Errors=%+v", len(result.Publish.Updates), result.Errors)
+	}
+	var entry catalog.CatalogEntry
+	if err := json.Unmarshal(result.Publish.Updates[0].SignedEntry, &entry); err != nil {
+		t.Fatalf("parsing entry: %v", err)
+	}
+	if entry.EntryVersion != 7 {
+		t.Errorf("EntryVersion = %d, want 7 (continuing from the tombstone's 6)", entry.EntryVersion)
+	}
+	if entry.Baseline.Version != 1 {
+		t.Errorf("Baseline.Version = %d, want a fresh baseline at 1", entry.Baseline.Version)
+	}
+}
+
 // TestPublish_RetireWithLatestPublished_WritesFinalTombstone proves
 // CON-TBD-38: retiring a catalog whose PriorState.LatestPublished is set
 // must produce a final, self-signed CatalogFileDoc carrying retiredAt --
