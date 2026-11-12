@@ -245,6 +245,39 @@ type CatalogState struct {
 	// EntryVersion keeps its lineage (NFH-014 CON-TBD-03) instead of
 	// restarting from zero.
 	Retired bool
+
+	// NameConflicts lists every other index entry whose files are written
+	// under the same names as this catalogId's (same FileNameKey), in index
+	// order. Empty in the normal case. For a catalogId that is not in the
+	// index it means the id cannot be published: its first baseline would
+	// overwrite another catalog's. For one that is, it means an index
+	// written before this was checked already holds two catalogs sharing
+	// files.
+	NameConflicts []NameConflict
+
+	// Unreadable, when not empty, says why this catalog's published content
+	// could not be reconstructed from its own files (a baseline or change
+	// file is missing or corrupt). Catalog is nil then, but EntryVersion,
+	// the metadata fields, BaselineFile, ChangeFiles and LatestPublished are
+	// still filled in from the index entry, so the catalog can be retired or
+	// given a fresh baseline with its version lineage intact. There is
+	// nothing to diff a submission against.
+	Unreadable string
+}
+
+// NameConflict is one other index entry that shares a catalogId's file
+// names. Retired says whether that entry is a tombstone.
+type NameConflict struct {
+	CatalogID string
+	Retired   bool
+}
+
+// Known reports whether s describes a catalogId that has an index entry,
+// live or retired. LoadCatalogs can also return a state for an id that has
+// none, carrying only NameConflicts; the zero CatalogState is not Known
+// either.
+func (s CatalogState) Known() bool {
+	return s.Retired || s.Catalog != nil || s.BaselineFile != nil || s.EntryVersion > 0 || s.Unreadable != ""
 }
 
 // FileWrite is one file's content to persist. Version drives the
@@ -335,24 +368,41 @@ type fileEnvelope struct {
 
 // LoadCatalogs reconstructs current state -- baseline with every change
 // file applied -- for each of catalogIDs that has prior publish history.
-// A requested catalogId absent from the result has none: the caller
-// starts a fresh baseline for it.
+// A requested catalogId that has no index entry and no name conflict is
+// absent from the result: the caller starts a fresh baseline for it.
 //
-// A retired catalogId is present in the result with CatalogState.Retired
-// set and no content (Catalog, BaselineFile and ChangeFiles are empty).
-// Presence in the result therefore does not by itself mean there is
-// content to diff against; check Retired, or Catalog, for that.
+// Presence in the result does not by itself mean there is content to diff
+// against. Use CatalogState.Known to tell whether the id has an index
+// entry at all, and then:
+//
+//   - a retired catalogId has Retired set and no content (Catalog,
+//     BaselineFile and ChangeFiles are empty);
+//   - a live entry that lists no baseline has only its entry-level fields
+//     (EntryVersion and metadata), so its version lineage continues;
+//   - a live entry whose files cannot be read back has Unreadable set (see
+//     CatalogState.Unreadable). Only content that is missing or corrupt is
+//     reported this way; a blob store that fails for another reason still
+//     fails the whole call, since nothing can be concluded from it;
+//   - any id, in the index or not, whose file names are also used by
+//     another index entry has NameConflicts set.
 func (s *Store) LoadCatalogs(ctx context.Context, catalogIDs []string) (map[string]CatalogState, error) {
 	s.log.DebugContext(ctx, "catalogstore: LoadCatalogs", "requested", len(catalogIDs))
-	entries, _, err := s.readIndexEntries(ctx)
+	entries, order, err := s.readIndexEntries(ctx)
 	if err != nil {
 		return nil, err
 	}
+	owners := nameOwners(entries, order)
 
 	result := make(map[string]CatalogState, len(catalogIDs))
 	for _, id := range catalogIDs {
+		conflicts := conflictsFor(owners, id)
 		rawEntry, ok := entries[id]
 		if !ok {
+			if len(conflicts) > 0 {
+				s.log.WarnContext(ctx, "catalogstore: catalog not in index, and its file names belong to another catalog", "catalogId", id, "sharedWith", conflicts[0].CatalogID)
+				result[id] = CatalogState{NameConflicts: conflicts}
+				continue
+			}
 			s.log.DebugContext(ctx, "catalogstore: catalog not in index, starting fresh", "catalogId", id)
 			continue
 		}
@@ -363,26 +413,134 @@ func (s *Store) LoadCatalogs(ctx context.Context, catalogIDs []string) (map[stri
 		if entry.IsRetired() {
 			s.log.DebugContext(ctx, "catalogstore: catalog already retired, returning tombstone state", "catalogId", id, "entryVersion", entry.EntryVersion)
 			result[id] = CatalogState{
-				EntryVersion: entry.EntryVersion,
-				CatalogType:  entry.CatalogType,
-				NetworkIds:   entry.NetworkIDs,
-				SchemaTypes:  entry.SchemaTypes,
-				Retired:      true,
+				EntryVersion:  entry.EntryVersion,
+				CatalogType:   entry.CatalogType,
+				NetworkIds:    entry.NetworkIDs,
+				SchemaTypes:   entry.SchemaTypes,
+				Retired:       true,
+				NameConflicts: conflicts,
 			}
 			continue
 		}
 		if entry.Baseline.URL == "" {
-			s.log.DebugContext(ctx, "catalogstore: no publishable prior state, starting fresh", "catalogId", id)
-			continue // no publishable prior state; caller starts a fresh baseline
+			// Listed, not retired, but with nothing to fetch. There is no
+			// content to diff against, so the caller publishes a fresh
+			// baseline -- but from this entry's entryVersion, not from zero
+			// (NFH-014 CON-TBD-03), and it can still be retired.
+			s.log.DebugContext(ctx, "catalogstore: entry lists no baseline, returning entry-level state only", "catalogId", id, "entryVersion", entry.EntryVersion)
+			state := entryLevelState(entry)
+			state.NameConflicts = conflicts
+			if state.Known() {
+				result[id] = state
+			}
+			continue
 		}
 		state, err := s.reconstructState(ctx, entry)
+		var unreadable *unreadableError
+		if errors.As(err, &unreadable) {
+			s.log.ErrorContext(ctx, "catalogstore: published content cannot be read back", "catalogId", id, "error", err)
+			broken := entryLevelState(entry)
+			baseline := entry.Baseline
+			broken.BaselineFile = &baseline
+			broken.ChangeFiles = entry.Changes
+			broken.LatestPublished = entry.Latest != nil
+			broken.Unreadable = err.Error()
+			broken.NameConflicts = conflicts
+			result[id] = broken
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
+		state.NameConflicts = conflicts
 		result[id] = *state
 	}
 	s.log.DebugContext(ctx, "catalogstore: LoadCatalogs done", "requested", len(catalogIDs), "reconstructed", len(result))
 	return result, nil
+}
+
+// entryLevelState is the part of a CatalogState that comes from a live
+// index entry alone, without reading any file.
+func entryLevelState(entry catalog.CatalogEntry) CatalogState {
+	isActive := true
+	if entry.IsActive != nil {
+		isActive = *entry.IsActive
+	}
+	var deps []catalog.MasterDependency
+	if entry.Dependencies != nil {
+		deps = entry.Dependencies.Masters
+	}
+	return CatalogState{
+		EntryVersion: entry.EntryVersion,
+		CatalogType:  entry.CatalogType,
+		NetworkIds:   entry.NetworkIDs,
+		SchemaTypes:  entry.SchemaTypes,
+		IsActive:     isActive,
+		Dependencies: deps,
+		CrawlHint:    entry.CrawlHint,
+	}
+}
+
+// unreadableError marks a reconstructState failure caused by the published
+// content itself -- a file that is not there, or that does not decompress,
+// parse or apply -- as opposed to the blob store failing to answer. Only
+// the first kind is a fact about one catalog.
+type unreadableError struct{ err error }
+
+func (e *unreadableError) Error() string { return e.err.Error() }
+func (e *unreadableError) Unwrap() error { return e.err }
+
+// getContent is blobs.Get for a catalog's own file: a file that does not
+// exist is an unreadableError; any other failure is returned as it is.
+func (s *Store) getContent(ctx context.Context, path string) ([]byte, error) {
+	raw, err := s.blobs.Get(ctx, path)
+	if errors.Is(err, ErrBlobNotFound) {
+		return nil, &unreadableError{fmt.Errorf("catalogstore: %s is listed in the index but missing from storage", path)}
+	}
+	if err != nil {
+		return nil, fmt.Errorf("catalogstore: reading %s: %w", path, err)
+	}
+	return raw, nil
+}
+
+// nameOwner is one index entry as nameOwners sees it.
+type nameOwner struct {
+	catalogID string
+	retired   bool
+}
+
+// nameOwners groups every index entry, live or retired, by FileNameKey, in
+// index order. A retired entry still owns its file names: its baseline and
+// change files are immutable (CON-TBD-23) and its final "latest" file is
+// meant to stay served (CON-TBD-38).
+func nameOwners(entries map[string]json.RawMessage, order []string) map[string][]nameOwner {
+	owners := make(map[string][]nameOwner, len(order))
+	seen := make(map[string]bool, len(order))
+	for _, id := range order {
+		if seen[id] {
+			continue // an index that lists one catalogId twice: one owner, not two
+		}
+		seen[id] = true
+		var probe struct {
+			RetiredAt string `json:"retiredAt"`
+		}
+		_ = json.Unmarshal(entries[id], &probe)
+		key := FileNameKey(id)
+		owners[key] = append(owners[key], nameOwner{catalogID: id, retired: probe.RetiredAt != ""})
+	}
+	return owners
+}
+
+// conflictsFor returns the entries in owners that share catalogID's file
+// names, leaving out catalogID itself.
+func conflictsFor(owners map[string][]nameOwner, catalogID string) []NameConflict {
+	var out []NameConflict
+	for _, o := range owners[FileNameKey(catalogID)] {
+		if o.catalogID != catalogID {
+			out = append(out, NameConflict{CatalogID: o.catalogID, Retired: o.retired})
+		}
+	}
+	return out
 }
 
 // readIndexEntries reads the current index (if any), returning every
@@ -425,20 +583,20 @@ func (s *Store) readIndexEntries(ctx context.Context) (map[string]json.RawMessag
 func (s *Store) reconstructState(ctx context.Context, entry catalog.CatalogEntry) (*CatalogState, error) {
 	baselineGzip := isGzipEncoded(entry.Baseline)
 	baselinePath := CatalogFilePath(entry.CatalogID, entry.Baseline.Version, "json", baselineGzip)
-	baselineBytes, err := s.blobs.Get(ctx, baselinePath)
+	baselineBytes, err := s.getContent(ctx, baselinePath)
 	if err != nil {
 		s.log.ErrorContext(ctx, "catalogstore: reading baseline failed", "catalogId", entry.CatalogID, "path", baselinePath, "error", err)
-		return nil, fmt.Errorf("catalogstore: reading %s: %w", baselinePath, err)
+		return nil, err
 	}
 	s.log.DebugContext(ctx, "catalogstore: read baseline", "catalogId", entry.CatalogID, "path", baselinePath, "bytes", len(baselineBytes))
 	if baselineGzip {
 		if baselineBytes, err = gunzip(baselineBytes); err != nil {
-			return nil, fmt.Errorf("catalogstore: decompressing %s: %w", baselinePath, err)
+			return nil, &unreadableError{fmt.Errorf("catalogstore: decompressing %s: %w", baselinePath, err)}
 		}
 	}
 	var wrapped fileEnvelope
 	if err := json.Unmarshal(baselineBytes, &wrapped); err != nil {
-		return nil, fmt.Errorf("catalogstore: parsing %s: %w", baselinePath, err)
+		return nil, &unreadableError{fmt.Errorf("catalogstore: parsing %s: %w", baselinePath, err)}
 	}
 
 	// A change file's EffectiveVersion is only ever <= the current
@@ -461,19 +619,19 @@ func (s *Store) reconstructState(ctx context.Context, entry catalog.CatalogEntry
 	for _, ch := range entry.Changes {
 		chGzip := isGzipEncoded(ch)
 		chPath := CatalogFilePath(entry.CatalogID, ch.EffectiveVersion(), "changes.json", chGzip)
-		raw, err := s.blobs.Get(ctx, chPath)
+		raw, err := s.getContent(ctx, chPath)
 		if err != nil {
 			s.log.ErrorContext(ctx, "catalogstore: reading change file failed", "catalogId", entry.CatalogID, "path", chPath, "error", err)
-			return nil, fmt.Errorf("catalogstore: reading %s: %w", chPath, err)
+			return nil, err
 		}
 		if chGzip {
 			if raw, err = gunzip(raw); err != nil {
-				return nil, fmt.Errorf("catalogstore: decompressing %s: %w", chPath, err)
+				return nil, &unreadableError{fmt.Errorf("catalogstore: decompressing %s: %w", chPath, err)}
 			}
 		}
 		effective, err = catalog.Apply(effective, raw)
 		if err != nil {
-			return nil, fmt.Errorf("catalogstore: applying %s: %w", chPath, err)
+			return nil, &unreadableError{fmt.Errorf("catalogstore: applying %s: %w", chPath, err)}
 		}
 		superseded := ch.EffectiveVersion() <= entry.Baseline.Version
 		if superseded && gracePeriodElapsed {
@@ -486,28 +644,13 @@ func (s *Store) reconstructState(ctx context.Context, entry catalog.CatalogEntry
 		changeFiles = append(changeFiles, ch)
 	}
 
-	isActive := true
-	if entry.IsActive != nil {
-		isActive = *entry.IsActive
-	}
+	state := entryLevelState(entry)
 	baseline := entry.Baseline
-	var deps []catalog.MasterDependency
-	if entry.Dependencies != nil {
-		deps = entry.Dependencies.Masters
-	}
-	return &CatalogState{
-		Catalog:         effective,
-		BaselineFile:    &baseline,
-		ChangeFiles:     changeFiles,
-		EntryVersion:    entry.EntryVersion,
-		CatalogType:     entry.CatalogType,
-		NetworkIds:      entry.NetworkIDs,
-		SchemaTypes:     entry.SchemaTypes,
-		IsActive:        isActive,
-		Dependencies:    deps,
-		CrawlHint:       entry.CrawlHint,
-		LatestPublished: entry.Latest != nil,
-	}, nil
+	state.Catalog = effective
+	state.BaselineFile = &baseline
+	state.ChangeFiles = changeFiles
+	state.LatestPublished = entry.Latest != nil
+	return &state, nil
 }
 
 // --- writes -------------------------------------------------------------

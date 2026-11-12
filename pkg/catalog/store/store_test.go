@@ -354,3 +354,42 @@ func TestValidateCatalogID(t *testing.T) {
 		}
 	}
 }
+
+// publishBaseline publishes one baseline for id through the real Store.
+func publishBaseline(t *testing.T, s *store.Store, id string) error {
+	t.Helper()
+	content := baselineFile(t, id, json.RawMessage(`{"id":"x","descriptor":{"name":"x"}}`), time.Now().Add(time.Hour))
+	entry := `{"catalogId":"` + id + `","entryVersion":1,"baseline":{"version":1,"url":"https://example.test/catalogs/` + store.LocalName(id) + `.v1.json","size":1,"digest":"sha-256:00"}}`
+	return s.Publish(context.Background(), store.PublishRequest{NodeID: "example.test", Updates: []store.CatalogUpdate{{
+		CatalogID: id, SignedEntry: json.RawMessage(entry), Baseline: &store.FileWrite{Version: 1, Content: content},
+	}}})
+}
+
+// TestLoadCatalogs_ReportsNameConflicts: LoadCatalogs tells the caller when
+// a requested id's file names belong to another index entry, whether or
+// not the requested id is itself in the index.
+func TestLoadCatalogs_ReportsNameConflicts(t *testing.T) {
+	blobs := newFakeBlobStore()
+	s := store.New(blobs)
+	if err := publishBaseline(t, s, "a.example/CAT-1"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if err := publishBaseline(t, s, "a.example/CAT-2"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	states, err := s.LoadCatalogs(context.Background(), []string{"a.example/CAT-1", "b.example/cat-1", "b.example/CAT-3"})
+	if err != nil {
+		t.Fatalf("LoadCatalogs: %v", err)
+	}
+	if st := states["a.example/CAT-1"]; !st.Known() || len(st.NameConflicts) != 0 {
+		t.Errorf("a.example/CAT-1: %+v, want known with no conflicts", st)
+	}
+	st, present := states["b.example/cat-1"]
+	if !present || st.Known() || len(st.NameConflicts) != 1 || st.NameConflicts[0] != (store.NameConflict{CatalogID: "a.example/CAT-1"}) {
+		t.Errorf("b.example/cat-1: present=%v %+v, want not known, in conflict with a.example/CAT-1", present, st)
+	}
+	if _, present := states["b.example/CAT-3"]; present {
+		t.Error("b.example/CAT-3 has no entry and no conflict; it must be absent from the result")
+	}
+}
