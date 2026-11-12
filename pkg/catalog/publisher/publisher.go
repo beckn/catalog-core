@@ -404,8 +404,21 @@ func admit(sub Submission, prior store.CatalogState, claimed map[string]string) 
 		return "validate", fmt.Errorf("catalogId %q is retired and cannot be published again (NFH-014 CON-TBD-26); publish this catalog under a new catalogId", id)
 	}
 	if !prior.Known() {
+		if err := store.ValidateCatalogID(id); err != nil {
+			return "validate", err
+		}
+		if len(prior.NameConflicts) > 0 {
+			return "validate", fmt.Errorf("catalogId %q would be stored under the same file names as %q, which is already in the catalog index (file names come from the text after the last \"/\" of the id, compared without regard to case); use a catalogId whose last segment is different", id, prior.NameConflicts[0].CatalogID)
+		}
 	} else {
-		_ = 0
+		for _, c := range prior.NameConflicts {
+			if !c.Retired {
+				return "validate", fmt.Errorf("catalogId %q shares its file names with %q, which is also published, so each one's files overwrite the other's; retire one of them, then publish the other with forceBaseline", id, c.CatalogID)
+			}
+		}
+	}
+	if other, taken := claimed[store.FileNameKey(id)]; taken && other != id {
+		return "validate", fmt.Errorf("catalogId %q would be stored under the same file names as %q, which is published in the same call (file names come from the text after the last \"/\" of the id, compared without regard to case); use a catalogId whose last segment is different", id, other)
 	}
 	return "", nil
 }
@@ -481,7 +494,7 @@ func (p Params) retireOne(ctx context.Context, id string, now time.Time, fileNex
 	if shared {
 		log.WarnContext(ctx, "catalog/publisher: not writing a final latest tombstone, the file is shared with a live catalog", "catalogId", id, "sharedWith", sharedWith)
 	}
-	if prior.LatestPublished {
+	if prior.LatestPublished && !shared {
 		if prior.Catalog == nil {
 			log.WarnContext(ctx, "catalog/publisher: cannot write final latest tombstone, prior catalog content missing", "catalogId", id)
 			result.Errors = append(result.Errors, PublishError{
