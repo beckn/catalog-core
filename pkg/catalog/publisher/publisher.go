@@ -403,6 +403,9 @@ func admit(sub Submission, prior store.CatalogState, claimed map[string]string) 
 	if prior.Retired {
 		return "validate", fmt.Errorf("catalogId %q is retired and cannot be published again (NFH-014 CON-TBD-26); publish this catalog under a new catalogId", id)
 	}
+	if prior.Unreadable != "" && !sub.Directives.ForceBaseline {
+		return "load", fmt.Errorf("the published content of catalogId %q cannot be read back, so there is nothing to compare this submission with (%s); publish it with forceBaseline to start from a new baseline, or retire it", id, prior.Unreadable)
+	}
 	if !prior.Known() {
 		if err := store.ValidateCatalogID(id); err != nil {
 			return "validate", err
@@ -922,6 +925,11 @@ func validateSubmission(sub Submission) error {
 	if sub.CatalogID == "" {
 		return fmt.Errorf("missing catalogId")
 	}
+	switch sub.CatalogType {
+	case "", "REGULAR", "MASTER":
+	default:
+		return fmt.Errorf("invalid catalogType %q (must be \"REGULAR\" or \"MASTER\")", sub.CatalogType)
+	}
 	var c struct {
 		ID         string          `json:"id"`
 		Descriptor json.RawMessage `json:"descriptor"`
@@ -932,6 +940,12 @@ func validateSubmission(sub Submission) error {
 	}
 	if c.ID == "" || len(c.Descriptor) == 0 {
 		return fmt.Errorf("catalog missing id/descriptor")
+	}
+	if len(c.IsActive) > 0 && string(c.IsActive) != "null" {
+		var b bool
+		if err := json.Unmarshal(c.IsActive, &b); err != nil {
+			return fmt.Errorf("catalog isActive must be true or false, got %s", c.IsActive)
+		}
 	}
 	return nil
 }
