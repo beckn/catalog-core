@@ -215,7 +215,10 @@ type Outcome struct {
 	Mode    string
 	Content json.RawMessage
 
-	// LatestContent/LatestDigest are set whenever PublishLatest is on.
+	// LatestDigest is set whenever the entry lists "latest".
+	// LatestContent is set only when this call (re)writes the file: an
+	// unchanged or metadata-only outcome whose published "latest" is intact
+	// keeps it as it is, so its digest changes only when its content does.
 	LatestContent json.RawMessage
 	LatestDigest  string
 }
@@ -239,6 +242,43 @@ type Result struct {
 	Publish     store.PublishRequest
 	Reports     []Outcome
 	Errors      []PublishError
+
+	// Retired reports every catalogId this call was asked to retire,
+	// including one that was retired already (for which Publish.Retirements
+	// has no update unless a "latest" file had to be repaired).
+	Retired []RetireReport
+}
+
+// RetireReport is what a retire request left in place for one catalog: the
+// tombstone's identity, and every "latest" file a consumer may still hold a
+// URL for -- each of which must now serve a CatalogFile carrying retiredAt
+// (NFH-014 CON-TBD-38). A caller that verifies its publishes re-fetches each
+// one; that holds for a repeat retire too, which is how a retirement whose
+// first attempt could not be verified gets verified.
+type RetireReport struct {
+	CatalogID    string
+	EntryVersion int64
+	RetiredAt    string // as in the index entry
+
+	// AlreadyRetired is true when the index entry was a tombstone before
+	// this call: no new tombstone was signed.
+	AlreadyRetired bool
+
+	Latest []RetiredLatestFile
+}
+
+// RetiredLatestFile is one "latest" file of a retired catalog.
+type RetiredLatestFile struct {
+	// File is the reference a consumer would verify it against: its stable
+	// URL, the digest of Content, the served size, the encoding.
+	File catalog.FileEntry
+	// Compressed says which of the two "latest" names it is stored under.
+	Compressed bool
+	// Content is the canonical signed CatalogFile, retiredAt included.
+	Content json.RawMessage
+	// Written is true when this call writes it (Publish.Retirements carries
+	// the bytes); false when the blob store already held exactly this.
+	Written bool
 }
 
 // outcome is publishOne/finishEntry's full internal result -- Publish
@@ -257,6 +297,9 @@ type outcome struct {
 	LatestContent       json.RawMessage
 	LatestServedContent []byte
 	LatestDigest        string
+	// LatestCompressed is the encoding of the "latest" write: the one it
+	// was last published under, which is not necessarily Params.Gzip.
+	LatestCompressed bool
 }
 
 // IndexURL returns the configured index location under publicBaseURL, or
@@ -332,6 +375,23 @@ func Publish(ctx context.Context, p Params) (Result, error) {
 			log.ErrorContext(ctx, "catalog/publisher: signing catalog entry failed", "catalogId", sub.CatalogID, "error", err)
 			return result, fmt.Errorf("catalog/publisher: signing catalog entry %q: %w", sub.CatalogID, err)
 		}
+		// "Unchanged" must mean the entry itself is unchanged: entryVersion
+		// has to move on any change to the entry (NFH-014 Versioning), and
+		// a consumer skips an entry whose entryVersion it has seen. The
+		// submission can be identical and the entry still differ from the
+		// one in the index -- its "latest" reference appeared, went away or
+		// was repaired, superseded change files left the list after a
+		// compaction's grace period, the signing key changed. Signing is
+		// deterministic, so comparing with the stored entry settles it for
+		// every such cause at once.
+		if prior := p.PriorState[sub.CatalogID]; oc.Mode == "unchanged" && len(prior.SignedEntry) > 0 && !bytes.Equal(raw, prior.SignedEntry) {
+			entry.EntryVersion = prior.EntryVersion + 1
+			oc.EntryVersion, oc.Changed, oc.Mode = entry.EntryVersion, true, "metadata"
+			log.DebugContext(ctx, "catalog/publisher: entry differs from the published one, entry version bumped", "catalogId", sub.CatalogID, "entryVersion", entry.EntryVersion)
+			if raw, err = p.signEntry(entry); err != nil {
+				return result, fmt.Errorf("catalog/publisher: signing catalog entry %q: %w", sub.CatalogID, err)
+			}
+		}
 
 		update := store.CatalogUpdate{CatalogID: sub.CatalogID, SignedEntry: raw}
 		if oc.Content != nil {
@@ -344,7 +404,7 @@ func Publish(ctx context.Context, p Params) (Result, error) {
 			}
 		}
 		if oc.LatestContent != nil {
-			update.Latest = &store.FileWrite{Version: oc.Version, Content: oc.LatestContent, ServedContent: oc.LatestServedContent, Compressed: p.Gzip}
+			update.Latest = &store.FileWrite{Version: oc.Version, Content: oc.LatestContent, ServedContent: oc.LatestServedContent, Compressed: oc.LatestCompressed}
 		}
 		result.Publish.Updates = append(result.Publish.Updates, update)
 		result.Reports = append(result.Reports, Outcome{
@@ -370,16 +430,16 @@ func (p Params) retireOne(ctx context.Context, id string, now time.Time, fileNex
 	// one would move retiredAt, so it no longer matches the final
 	// "latest" file, for no change in what a consumer should conclude.
 	if prior.Retired {
-		log.DebugContext(ctx, "catalog/publisher: catalog already retired, nothing to do", "catalogId", id, "entryVersion", prior.EntryVersion)
-		return nil
+		return p.recheckRetired(ctx, id, prior, fileNextUpdate, result)
 	}
+	retiredAt := now.Format(time.RFC3339Nano)
 	raw, err := p.signEntry(catalog.CatalogEntry{
 		CatalogID:    id,
 		EntryVersion: prior.EntryVersion + 1,
 		CatalogType:  prior.CatalogType,
 		NetworkIDs:   prior.NetworkIds,
 		SchemaTypes:  prior.SchemaTypes,
-		RetiredAt:    now.Format(time.RFC3339Nano),
+		RetiredAt:    retiredAt,
 	})
 	if err != nil {
 		log.ErrorContext(ctx, "catalog/publisher: signing tombstone failed", "catalogId", id, "error", err)
@@ -387,15 +447,18 @@ func (p Params) retireOne(ctx context.Context, id string, now time.Time, fileNex
 	}
 	log.DebugContext(ctx, "catalog/publisher: catalog retired", "catalogId", id, "entryVersion", prior.EntryVersion+1, "latestPublished", prior.LatestPublished)
 	update := store.CatalogUpdate{CatalogID: id, SignedEntry: raw}
+	report := RetireReport{CatalogID: id, EntryVersion: prior.EntryVersion + 1, RetiredAt: retiredAt}
 
 	// CON-TBD-38: a catalog that had "latest" published needs one final
 	// write to that same stable URL, populating CatalogFileDoc.retiredAt
 	// -- otherwise a consumer that only ever fetches "latest" directly,
 	// never revisiting the index, has no way to learn the catalog is
-	// gone. Independent of today's PublishLatest: this is cleaning up a
-	// file that already exists, not deciding whether to start publishing
-	// a new one.
-	if prior.LatestPublished {
+	// gone. Where that write goes is decided by what was published, not by
+	// today's Gzip or PublishLatest: the name the prior entry advertised,
+	// and any other "latest" file the blob store still holds (PublishLatest
+	// switched off since, or a file left under the other name), because a
+	// consumer may hold any of those URLs.
+	if targets := p.retireLatestTargets(prior); len(targets) > 0 {
 		if prior.Catalog == nil {
 			log.WarnContext(ctx, "catalog/publisher: cannot write final latest tombstone, prior catalog content missing", "catalogId", id)
 			result.Errors = append(result.Errors, PublishError{
@@ -408,16 +471,131 @@ func (p Params) retireOne(ctx context.Context, id string, now time.Time, fileNex
 				log.ErrorContext(ctx, "catalog/publisher: signing final latest tombstone failed", "catalogId", id, "error", err)
 				return fmt.Errorf("catalog/publisher: signing final \"latest\" tombstone %q: %w", id, err)
 			}
-			served, _, _, err := maybeCompress(content, "json", p.Gzip)
-			if err != nil {
-				return fmt.Errorf("catalog/publisher: compressing final \"latest\" tombstone %q: %w", id, err)
+			for _, compressed := range targets {
+				if err := p.addRetiredLatest(&update, &report, id, currentVersion(prior), content, compressed); err != nil {
+					return err
+				}
+				log.DebugContext(ctx, "catalog/publisher: wrote final latest tombstone", "catalogId", id, "compressed", compressed)
 			}
-			update.Latest = &store.FileWrite{Content: content, ServedContent: served, Compressed: p.Gzip}
-			log.DebugContext(ctx, "catalog/publisher: wrote final latest tombstone", "catalogId", id)
 		}
 	}
 	result.Publish.Retirements = append(result.Publish.Retirements, update)
+	result.Retired = append(result.Retired, report)
 	return nil
+}
+
+// retireLatestTargets lists the "latest" names (compressed or not) that
+// must receive the final tombstone: the one the prior entry advertised
+// first, then any other the blob store holds.
+func (p Params) retireLatestTargets(prior store.CatalogState) []bool {
+	var targets []bool
+	add := func(compressed bool) {
+		for _, t := range targets {
+			if t == compressed {
+				return
+			}
+		}
+		targets = append(targets, compressed)
+	}
+	switch {
+	case prior.LatestFile != nil:
+		add(fileEntryCompressed(*prior.LatestFile))
+	case prior.LatestPublished && len(prior.StoredLatest) == 0:
+		// A caller that built PriorState by hand and says only that
+		// "latest" was published: the current setting is all there is.
+		add(p.Gzip)
+	}
+	for _, st := range prior.StoredLatest {
+		add(st.Compressed)
+	}
+	return targets
+}
+
+// addRetiredLatest attaches one final "latest" write to update (a catalog
+// has at most two "latest" names, so at most two writes) and reports it.
+func (p Params) addRetiredLatest(update *store.CatalogUpdate, report *RetireReport, id string, version int64, content []byte, compressed bool) error {
+	fe, served, err := p.buildLatestFileEntry(id, version, content, compressed)
+	if err != nil {
+		return fmt.Errorf("catalog/publisher: compressing final \"latest\" tombstone %q: %w", id, err)
+	}
+	fw := &store.FileWrite{Content: content, ServedContent: served, Compressed: compressed}
+	if update.Latest == nil {
+		update.Latest = fw
+	} else {
+		update.LatestAlt = fw
+	}
+	report.Latest = append(report.Latest, RetiredLatestFile{File: fe, Compressed: compressed, Content: content, Written: true})
+	return nil
+}
+
+// recheckRetired handles a retire request for a catalog whose entry is
+// already a tombstone. The entry is never signed again. What it does do is
+// look at the "latest" files the blob store holds: one that already
+// carries retiredAt is reported so the caller can verify what is being
+// served; one that does not (an earlier release wrote the tombstone under
+// the other name, or left a file behind) gets its final write now, with
+// the retiredAt of the tombstone entry.
+func (p Params) recheckRetired(ctx context.Context, id string, prior store.CatalogState, fileNextUpdate time.Time, result *Result) error {
+	log := p.logger()
+	report := RetireReport{CatalogID: id, EntryVersion: prior.EntryVersion, RetiredAt: prior.RetiredAt, AlreadyRetired: true}
+	update := store.CatalogUpdate{CatalogID: id, SignedEntry: prior.SignedEntry}
+
+	// Content to rebuild a missing tombstone from: whatever readable
+	// "latest" file there is (a retired state carries no catalog itself).
+	var source *store.LatestFileState
+	for i := range prior.StoredLatest {
+		if st := &prior.StoredLatest[i]; st.Readable && len(st.Catalog) > 0 && (source == nil || st.Version > source.Version) {
+			source = st
+		}
+	}
+	for _, st := range prior.StoredLatest {
+		if st.Readable && st.RetiredAt != nil {
+			fe, _, err := p.buildLatestFileEntry(id, st.Version, st.Content, st.Compressed)
+			if err != nil {
+				return err
+			}
+			fe.Size = st.ServedSize
+			report.Latest = append(report.Latest, RetiredLatestFile{File: fe, Compressed: st.Compressed, Content: st.Content})
+			continue
+		}
+		retiredAt, err := time.Parse(time.RFC3339Nano, prior.RetiredAt)
+		if err != nil || source == nil || len(prior.SignedEntry) == 0 {
+			log.WarnContext(ctx, "catalog/publisher: retired catalog has a latest file without retiredAt that cannot be rebuilt", "catalogId", id, "compressed", st.Compressed)
+			result.Errors = append(result.Errors, PublishError{
+				CatalogID: id, Stage: "retire",
+				Reason: "a \"latest\" file of this retired catalog does not carry retiredAt and there is nothing to rebuild it from",
+			})
+			continue
+		}
+		version, cat := source.Version, source.Catalog
+		if st.Readable && len(st.Catalog) > 0 {
+			version, cat = st.Version, st.Catalog
+		}
+		content, err := p.signCatalogFile(id, version, fileNextUpdate, cat, &retiredAt)
+		if err != nil {
+			return fmt.Errorf("catalog/publisher: signing final \"latest\" tombstone %q: %w", id, err)
+		}
+		if err := p.addRetiredLatest(&update, &report, id, version, content, st.Compressed); err != nil {
+			return err
+		}
+		log.InfoContext(ctx, "catalog/publisher: repaired a latest file of an already retired catalog", "catalogId", id, "compressed", st.Compressed)
+	}
+	if update.Latest != nil {
+		result.Publish.Retirements = append(result.Publish.Retirements, update)
+	} else {
+		log.DebugContext(ctx, "catalog/publisher: catalog already retired, nothing to write", "catalogId", id, "entryVersion", prior.EntryVersion)
+	}
+	result.Retired = append(result.Retired, report)
+	return nil
+}
+
+// fileEntryCompressed reports whether fe names a gzip file: its Encoding
+// when set, else the URL's ".gz" suffix (the same rule a reader applies).
+func fileEntryCompressed(fe catalog.FileEntry) bool {
+	if fe.Encoding != "" {
+		return fe.Encoding == "gzip"
+	}
+	return strings.HasSuffix(fe.URL, ".gz")
 }
 
 // publishOne decides baseline vs. change-file vs. metadata-only vs. no-op
@@ -516,7 +694,7 @@ func (p Params) publishOne(ctx context.Context, sub Submission, prior store.Cata
 			CatalogID: sub.CatalogID, Version: version, EntryVersion: entry.EntryVersion, Changed: true, Digest: fe.Digest, Mode: "baseline",
 			Content: content, ServedContent: served,
 		}
-		return p.finishEntry(ctx, sub, entry, oc, fileNextUpdate)
+		return p.finishEntry(ctx, sub, prior, entry, oc, fileNextUpdate)
 	}
 
 	if !contentChanged {
@@ -525,12 +703,12 @@ func (p Params) publishOne(ctx context.Context, sub Submission, prior store.Cata
 			log.DebugContext(ctx, "catalog/publisher: no-op, nothing changed", "catalogId", sub.CatalogID)
 			entry.EntryVersion = prior.EntryVersion
 			oc := outcome{CatalogID: sub.CatalogID, Version: version, EntryVersion: entry.EntryVersion, Changed: false, Mode: "unchanged"}
-			return p.finishEntry(ctx, sub, entry, oc, fileNextUpdate)
+			return p.finishEntry(ctx, sub, prior, entry, oc, fileNextUpdate)
 		}
 		log.DebugContext(ctx, "catalog/publisher: metadata-only change, no new file", "catalogId", sub.CatalogID, "entryVersion", prior.EntryVersion+1)
 		entry.EntryVersion = prior.EntryVersion + 1
 		oc := outcome{CatalogID: sub.CatalogID, Version: version, EntryVersion: entry.EntryVersion, Changed: true, Mode: "metadata"}
-		return p.finishEntry(ctx, sub, entry, oc, fileNextUpdate)
+		return p.finishEntry(ctx, sub, prior, entry, oc, fileNextUpdate)
 	}
 	log.DebugContext(ctx, "catalog/publisher: publishing change file", "catalogId", sub.CatalogID, "fromVersion", currentVersion(prior))
 
@@ -558,33 +736,95 @@ func (p Params) publishOne(ctx context.Context, sub Submission, prior store.Cata
 		CatalogID: sub.CatalogID, Version: toVersion, EntryVersion: entry.EntryVersion, Changed: true, Digest: fe.Digest, Mode: "change",
 		Content: content, ServedContent: served,
 	}
-	return p.finishEntry(ctx, sub, entry, oc, fileNextUpdate)
+	return p.finishEntry(ctx, sub, prior, entry, oc, fileNextUpdate)
 }
 
-// finishEntry adds a "latest" full-CatalogFileDoc pointer when
-// PublishLatest is on -- regenerated from sub.Catalog on every call
-// regardless of Mode, since "latest" always mirrors current content, not
-// a specific lineage step. A no-op when PublishLatest is off, which every
-// publishOne return path funnels through so "latest" (or its absence) is
-// applied uniformly rather than duplicated at each call site.
-func (p Params) finishEntry(ctx context.Context, sub Submission, entry catalog.CatalogEntry, oc outcome, fileNextUpdate time.Time) (outcome, catalog.CatalogEntry, error) {
-	if !p.PublishLatest {
-		return oc, entry, nil
+// finishEntry settles the entry's "latest" reference, which every
+// publishOne return path funnels through.
+//
+// "latest" is one file overwritten in place at a stable URL, so everything
+// about it follows what was last published (prior), not this call's
+// settings:
+//   - Its name. Once a catalog's "latest" has been advertised under one
+//     encoding it stays there; switching Gzip changes the baseline and
+//     change files from then on, not the URL consumers already hold.
+//   - Whether to write. A baseline or change rewrites it. An unchanged or
+//     metadata-only outcome leaves an intact file alone and carries its
+//     reference forward: the file's content is what it was, so its digest
+//     must be too (NFH-014 10.1), and the entry must not change under an
+//     unchanged entryVersion.
+//   - entryVersion. If an otherwise unchanged call does change the
+//     reference (PublishLatest switched on or off, the file was missing
+//     or damaged and is rewritten, the public base URL moved) the entry
+//     has changed; Publish sees that when it signs the entry and bumps
+//     entryVersion (see the "unchanged" check there).
+//
+// With PublishLatest off the entry lists no "latest". A file published
+// earlier stays where it is, unrefreshed; retiring the catalog still
+// writes its final tombstone (see retireOne).
+func (p Params) finishEntry(ctx context.Context, sub Submission, prior store.CatalogState, entry catalog.CatalogEntry, oc outcome, fileNextUpdate time.Time) (outcome, catalog.CatalogEntry, error) {
+	log := p.logger()
+	if p.PublishLatest {
+		compressed := p.latestCompressed(prior)
+		if kept := p.intactLatest(sub.CatalogID, prior, oc, compressed); kept != nil {
+			entry.Latest = kept
+			oc.LatestDigest = kept.Digest
+			log.DebugContext(ctx, "catalog/publisher: latest file intact, left as published", "catalogId", sub.CatalogID, "version", oc.Version)
+		} else {
+			content, err := p.signCatalogFile(sub.CatalogID, oc.Version, fileNextUpdate, sub.Catalog, nil)
+			if err != nil {
+				return outcome{}, catalog.CatalogEntry{}, err
+			}
+			fe, served, err := p.buildLatestFileEntry(sub.CatalogID, oc.Version, content, compressed)
+			if err != nil {
+				return outcome{}, catalog.CatalogEntry{}, err
+			}
+			entry.Latest = &fe
+			oc.LatestContent = content
+			oc.LatestServedContent = served
+			oc.LatestDigest = fe.Digest
+			oc.LatestCompressed = compressed
+			log.DebugContext(ctx, "catalog/publisher: latest pointer updated", "catalogId", sub.CatalogID, "version", oc.Version, "compressed", compressed)
+		}
 	}
-	content, err := p.signCatalogFile(sub.CatalogID, oc.Version, fileNextUpdate, sub.Catalog, nil)
-	if err != nil {
-		return outcome{}, catalog.CatalogEntry{}, err
-	}
-	fe, served, err := p.buildLatestFileEntry(sub.CatalogID, oc.Version, content)
-	if err != nil {
-		return outcome{}, catalog.CatalogEntry{}, err
-	}
-	entry.Latest = &fe
-	oc.LatestContent = content
-	oc.LatestServedContent = served
-	oc.LatestDigest = fe.Digest
-	p.logger().DebugContext(ctx, "catalog/publisher: latest pointer updated", "catalogId", sub.CatalogID, "version", oc.Version)
+
 	return oc, entry, nil
+}
+
+// latestCompressed decides which of the two "latest" names this catalog
+// uses: the one its entry already advertises; failing that, a file left in
+// the blob store from before PublishLatest was switched off (preferring the
+// one matching Gzip if both exist); and only for a catalog with no "latest"
+// anywhere, Gzip.
+func (p Params) latestCompressed(prior store.CatalogState) bool {
+	if prior.LatestFile != nil {
+		return fileEntryCompressed(*prior.LatestFile)
+	}
+	if prior.Stored(p.Gzip) == nil && prior.Stored(!p.Gzip) != nil {
+		return !p.Gzip
+	}
+	return p.Gzip
+}
+
+// intactLatest returns the prior entry's "latest" reference when this call
+// publishes no new content and the file it points at is still exactly what
+// that reference says: same name and URL as this call would use, current
+// version, and stored bytes whose digest matches. Otherwise nil, and the
+// file is rewritten.
+func (p Params) intactLatest(catalogID string, prior store.CatalogState, oc outcome, compressed bool) *catalog.FileEntry {
+	if oc.Content != nil || prior.LatestFile == nil {
+		return nil
+	}
+	ref := *prior.LatestFile
+	st := prior.Stored(compressed)
+	if st == nil || !st.Readable || st.RetiredAt != nil || st.Version != oc.Version || ref.Version != oc.Version {
+		return nil
+	}
+	want, _, err := p.buildLatestFileEntry(catalogID, oc.Version, st.Content, compressed)
+	if err != nil || want.URL != ref.URL || want.Digest != ref.Digest || st.ServedSize != ref.Size {
+		return nil
+	}
+	return &ref
 }
 
 // catalogIsActive reads the submitted Catalog's own pre-existing
@@ -712,9 +952,10 @@ func (p Params) buildFileEntry(catalogID string, version int64, suffix string, c
 // pointer: unlike a baseline/change file, its filename carries no version
 // number at all -- it is the one file this package overwrites in place on
 // every publish, explicitly exempt from the immutable-URL rule every
-// other file here follows.
-func (p Params) buildLatestFileEntry(catalogID string, version int64, content []byte) (catalog.FileEntry, []byte, error) {
-	served, fileSuffix, encoding, err := maybeCompress(content, "json", p.Gzip)
+// other file here follows. compressed is the caller's decision, taken from
+// what was last published (see finishEntry), not from Params.Gzip.
+func (p Params) buildLatestFileEntry(catalogID string, version int64, content []byte, compressed bool) (catalog.FileEntry, []byte, error) {
+	served, fileSuffix, encoding, err := maybeCompress(content, "json", compressed)
 	if err != nil {
 		return catalog.FileEntry{}, nil, err
 	}
