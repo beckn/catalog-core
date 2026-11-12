@@ -685,24 +685,32 @@ func TestPublish_CompactionThreshold_NeverForcesBaselineOnNoOp(t *testing.T) {
 	}
 }
 
+// TestPublish_Retire_ProducesTombstone: retiring a published catalog signs
+// a tombstone -- retiredAt, no files, no isActive. (Retiring an id that was
+// never published used to do the same at entryVersion 1; that is now
+// refused, see TestIdentity_RetireUnknown in identity_rules_test.go.)
 func TestPublish_Retire_ProducesTombstone(t *testing.T) {
 	priv, keyID := testSigningKey(t)
+	baseline := catalog.FileEntry{Version: 1, URL: "https://example.test/catalogs/CAT-OLD.v1.json", Digest: "sha-256:00", Size: 10}
 	result, err := Publish(context.Background(), Params{
-		Catalogs:   []Submission{{CatalogID: "CAT-OLD", Directives: PublishDirectives{Retire: true}}},
+		Catalogs: []Submission{{CatalogID: "CAT-OLD", Directives: PublishDirectives{Retire: true}}},
+		PriorState: map[string]store.CatalogState{
+			"CAT-OLD": {Catalog: validCatalogJSON("CAT-OLD"), BaselineFile: &baseline, EntryVersion: 1, IsActive: true},
+		},
 		SigningKey: priv, KeyID: keyID, Domain: "example.test",
 	})
 	if err != nil {
 		t.Fatalf("Publish: %v", err)
 	}
 
-	if len(result.Publish.Retirements) != 1 {
-		t.Fatalf("expected 1 tombstone entry, got %d", len(result.Publish.Retirements))
+	if len(result.Errors) != 0 || len(result.Publish.Retirements) != 1 {
+		t.Fatalf("expected 1 tombstone entry and no errors, got %d and %+v", len(result.Publish.Retirements), result.Errors)
 	}
 	var entry catalog.CatalogEntry
 	if err := json.Unmarshal(result.Publish.Retirements[0].SignedEntry, &entry); err != nil {
 		t.Fatalf("parsing entry: %v", err)
 	}
-	if entry.CatalogID != "CAT-OLD" || !entry.IsRetired() || entry.EntryVersion != 1 {
+	if entry.CatalogID != "CAT-OLD" || !entry.IsRetired() || entry.EntryVersion != 2 {
 		t.Errorf("unexpected tombstone: %+v", entry)
 	}
 	if entry.Baseline.URL != "" || len(entry.Changes) != 0 || entry.IsActive != nil {
@@ -868,34 +876,34 @@ func TestPublish_RetireTwiceThroughStore_LeavesTombstoneUntouched(t *testing.T) 
 	}
 }
 
-// TestPublish_SubmissionForRetiredCatalog_ContinuesEntryVersion: publishing
-// content under a retired catalogId still starts a fresh baseline (there is
-// no content to diff against), but EntryVersion continues from the
-// tombstone's rather than regressing to 1.
-func TestPublish_SubmissionForRetiredCatalog_ContinuesEntryVersion(t *testing.T) {
+// TestPublish_SubmissionForRetiredCatalog_IsRejected: retirement is one-way
+// (NFH-014 CON-TBD-05, CON-TBD-26). A submission under a retired catalogId
+// is a per-catalog error and nothing is signed for it. (This replaces
+// TestPublish_SubmissionForRetiredCatalog_ContinuesEntryVersion, which
+// asserted that such a submission was published as a fresh baseline.)
+func TestPublish_SubmissionForRetiredCatalog_IsRejected(t *testing.T) {
 	priv, keyID := testSigningKey(t)
-	result, err := Publish(context.Background(), Params{
-		Catalogs: []Submission{{CatalogID: "CAT-OLD", Catalog: mustCatalogWithItems("CAT-OLD", "ITEM-1")}},
-		PriorState: map[string]store.CatalogState{
-			"CAT-OLD": {EntryVersion: 6, CatalogType: "REGULAR", Retired: true},
-		},
-		SigningKey: priv, KeyID: keyID, Domain: "example.test",
-	})
-	if err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
-	if len(result.Errors) != 0 || len(result.Publish.Updates) != 1 {
-		t.Fatalf("expected one published update, got Updates=%d Errors=%+v", len(result.Publish.Updates), result.Errors)
-	}
-	var entry catalog.CatalogEntry
-	if err := json.Unmarshal(result.Publish.Updates[0].SignedEntry, &entry); err != nil {
-		t.Fatalf("parsing entry: %v", err)
-	}
-	if entry.EntryVersion != 7 {
-		t.Errorf("EntryVersion = %d, want 7 (continuing from the tombstone's 6)", entry.EntryVersion)
-	}
-	if entry.Baseline.Version != 1 {
-		t.Errorf("Baseline.Version = %d, want a fresh baseline at 1", entry.Baseline.Version)
+	for _, force := range []bool{false, true} {
+		result, err := Publish(context.Background(), Params{
+			Catalogs: []Submission{{
+				CatalogID: "CAT-OLD", Catalog: mustCatalogWithItems("CAT-OLD", "ITEM-1"),
+				Directives: PublishDirectives{ForceBaseline: force},
+			}},
+			PriorState: map[string]store.CatalogState{
+				"CAT-OLD": {EntryVersion: 6, CatalogType: "REGULAR", Retired: true},
+			},
+			SigningKey: priv, KeyID: keyID, Domain: "example.test",
+		})
+		if err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+		if len(result.Publish.Updates) != 0 || len(result.Reports) != 0 {
+			t.Fatalf("forceBaseline=%v: a retired catalogId was published: %+v", force, result.Reports)
+		}
+		if len(result.Errors) != 1 || result.Errors[0].CatalogID != "CAT-OLD" || result.Errors[0].Stage != "validate" ||
+			!strings.Contains(result.Errors[0].Reason, "new catalogId") {
+			t.Fatalf("forceBaseline=%v: expected one validate error telling the caller to use a new catalogId, got %+v", force, result.Errors)
+		}
 	}
 }
 

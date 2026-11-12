@@ -345,7 +345,7 @@ type Outcome struct {
 
 type PublishError struct {
     CatalogID string
-    Stage     string // "validate" | "diff" | "retire"
+    Stage     string // "validate" | "load" | "diff" | "retire"
     Reason    string
     Fatal     bool
 }
@@ -375,6 +375,8 @@ var ErrBlobNotFound = errors.New("catalogstore: blob not found")
 const IndexFilename = "becknCatalogs.index.json"
 func IndexPath() string
 func LocalName(catalogID string) string
+func FileNameKey(catalogID string) string    // equal for two ids that would share files
+func ValidateCatalogID(catalogID string) error // shape a catalogId needs before its first file is written
 func CatalogFilePath(catalogID string, version int64, suffix string, compressed bool) string
 func LatestFilePath(catalogID string, compressed bool) string
 
@@ -391,7 +393,16 @@ type CatalogState struct {
     CrawlHint       string
     LatestPublished bool
     Retired         bool // entry is already a tombstone; only EntryVersion/CatalogType/NetworkIds/SchemaTypes are set
+    NameConflicts   []NameConflict // other index entries written under the same file names
+    Unreadable      string         // why the published files could not be read back; Catalog is nil
 }
+
+type NameConflict struct {
+    CatalogID string
+    Retired   bool
+}
+
+func (s CatalogState) Known() bool // the id has an index entry, live or retired
 
 type FileWrite struct {
     Version       int64
@@ -451,3 +462,13 @@ func VerifyFileTuple(catalogID string, version int, url, digest string, validUnt
 **Building a crawler**: construct a `crawler.Client` and `crawler.KeySource`, wrap them in a `catalog.NewFetcher`, implement `crawlmanager.Source` (index discovery), `crawlmanager.Sink` (where resolved catalog content goes), and `crawlmanager.Store` (crawl-cursor persistence), then drive the loop with `crawlmanager.Params.PollIndexes` / `SyncNext`.
 
 **Building a publisher**: implement `store.BlobStore` over your storage backend, load prior state with `store.New(blobs).LoadCatalogs`, call `publisher.Publish` with your `Submission`s and signing key, then hand the resulting `Result.Publish` to `store.Store.Publish`.
+
+**What a `catalogId` may do.** `publisher.Publish` decides this from the `PriorState` that `LoadCatalogs` returned, so always pass it. Each refusal is a per-catalog `PublishError`; the other catalogs in the call are unaffected, and nothing is signed or written for the refused one.
+
+| Index entry for the id | Publish | Retire |
+|---|---|---|
+| None | Published as a baseline at version 1, `entryVersion` 1. Refused (`validate`) if the id fails `store.ValidateCatalogID`, or if its file names already belong to another entry, live or retired, or to another new id in the same call. | Refused (`retire`, "catalog not found"). No tombstone is signed. |
+| Live (`isActive` true or false) | Change file, metadata-only update, new baseline (`ForceBaseline` or compaction) or no-op. `entryVersion` goes up by one unless nothing changed. Refused (`load`) if its published files cannot be read back, unless `ForceBaseline` is set. | Tombstone at `entryVersion` + 1; one final write to `latest` if it was published. |
+| Retired | Refused (`validate`): retirement is one-way, use a new `catalogId` (NFH-014 CON-TBD-05, CON-TBD-26). | No-op; the tombstone is left as it is. |
+
+File names come from the id's last path segment (`store.LocalName`), so `a.example/CAT-1` and `b.example/CAT-1` cannot both be published by one publisher, and neither can `CAT-1` and `cat-1`. An id that is already in the index is never re-checked against the shape rules, so existing catalogs keep their ids, file names and URLs.

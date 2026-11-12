@@ -3,6 +3,8 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -303,5 +305,137 @@ func TestPublish_RetiredLatest_WritesFinalTombstone(t *testing.T) {
 	path := store.LatestFilePath("example.test/CAT-1", false)
 	if _, err := blobs.Get(ctx, path); err != nil {
 		t.Errorf("expected latest tombstone at %s: %v", path, err)
+	}
+}
+
+func TestFileNameKey(t *testing.T) {
+	for _, tc := range []struct{ a, b string }{
+		{"a.example/CAT-1", "b.example/CAT-1"},
+		{"a.example/CAT-1", "CAT-1"},
+		{"a.example/CAT-1", "a.example/cat-1"},
+		{"a.example/x/CAT-1", "a.example/y/CAT-1"},
+	} {
+		if store.FileNameKey(tc.a) != store.FileNameKey(tc.b) {
+			t.Errorf("%q and %q are written to the same files but have different keys", tc.a, tc.b)
+		}
+	}
+	if store.FileNameKey("a.example/CAT-1") == store.FileNameKey("a.example/CAT-2") {
+		t.Error("different last segments must have different keys")
+	}
+	// The key is for comparison only: file names keep the id's own case.
+	if got := store.CatalogFilePath("a.example/CAT-1", 1, "json", false); got != "catalogs/CAT-1.v1.json" {
+		t.Errorf("CatalogFilePath = %q; published file names must not change", got)
+	}
+	if got := store.LatestFilePath("a.example/CAT-1", true); got != "catalogs/CAT-1.latest.json.gz" {
+		t.Errorf("LatestFilePath = %q; published file names must not change", got)
+	}
+}
+
+func TestValidateCatalogID(t *testing.T) {
+	ok := []string{
+		"CAT-1", "open-economy.nfh.global/electronics-2026", "a.example/x/y/CAT_1.v2~b",
+		"a.example/" + strings.Repeat("x", store.MaxLocalNameBytes),
+	}
+	for _, id := range ok {
+		if err := store.ValidateCatalogID(id); err != nil {
+			t.Errorf("store.ValidateCatalogID(%q) = %v, want nil", id, err)
+		}
+	}
+	bad := []string{
+		"", " ", "a.example/", "/CAT-1", "a.example//CAT-1", "a.example/../CAT-1", "a.example/./CAT-1", "a.example/..", ".",
+		"a.example/.hidden", "a.example/CAT 1", " CAT-1", "CAT-1 ", "CAT-1\n", "a\texample/CAT-1", "a.example/%41",
+		"a.example/CAT?x", "a.example/CAT#x", `a.example/CAT\x`, "a.example/CAT:1", "a.example/CAT\x00", "a.example/CÄT",
+		"a.example/CAT\xff", "a.example/" + strings.Repeat("x", store.MaxLocalNameBytes+1), strings.Repeat("a/", 600) + "CAT-1",
+	}
+	for _, id := range bad {
+		if err := store.ValidateCatalogID(id); err == nil {
+			t.Errorf("store.ValidateCatalogID(%.40q) = nil, want an error", id)
+		} else if len(err.Error()) > 400 {
+			t.Errorf("error for %.40q is %d bytes long", id, len(err.Error()))
+		}
+	}
+}
+
+// publishBaseline publishes one baseline for id through the real Store.
+func publishBaseline(t *testing.T, s *store.Store, id string) error {
+	t.Helper()
+	content := baselineFile(t, id, json.RawMessage(`{"id":"x","descriptor":{"name":"x"}}`), time.Now().Add(time.Hour))
+	entry := `{"catalogId":"` + id + `","entryVersion":1,"baseline":{"version":1,"url":"https://example.test/catalogs/` + store.LocalName(id) + `.v1.json","size":1,"digest":"sha-256:00"}}`
+	return s.Publish(context.Background(), store.PublishRequest{NodeID: "example.test", Updates: []store.CatalogUpdate{{
+		CatalogID: id, SignedEntry: json.RawMessage(entry), Baseline: &store.FileWrite{Version: 1, Content: content},
+	}}})
+}
+
+// TestLoadCatalogs_ReportsNameConflicts: LoadCatalogs tells the caller when
+// a requested id's file names belong to another index entry, whether or
+// not the requested id is itself in the index.
+func TestLoadCatalogs_ReportsNameConflicts(t *testing.T) {
+	blobs := newFakeBlobStore()
+	s := store.New(blobs)
+	if err := publishBaseline(t, s, "a.example/CAT-1"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if err := publishBaseline(t, s, "a.example/CAT-2"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+
+	states, err := s.LoadCatalogs(context.Background(), []string{"a.example/CAT-1", "b.example/cat-1", "b.example/CAT-3"})
+	if err != nil {
+		t.Fatalf("LoadCatalogs: %v", err)
+	}
+	if st := states["a.example/CAT-1"]; !st.Known() || len(st.NameConflicts) != 0 {
+		t.Errorf("a.example/CAT-1: %+v, want known with no conflicts", st)
+	}
+	st, present := states["b.example/cat-1"]
+	if !present || st.Known() || len(st.NameConflicts) != 1 || st.NameConflicts[0] != (store.NameConflict{CatalogID: "a.example/CAT-1"}) {
+		t.Errorf("b.example/cat-1: present=%v %+v, want not known, in conflict with a.example/CAT-1", present, st)
+	}
+	if _, present := states["b.example/CAT-3"]; present {
+		t.Error("b.example/CAT-3 has no entry and no conflict; it must be absent from the result")
+	}
+}
+
+// TestPublish_RefusesNewIdThatWouldShareFiles: the store itself refuses,
+// before writing anything, a request that would put a new catalogId's
+// files on top of another catalog's -- whatever the caller checked.
+func TestPublish_RefusesNewIdThatWouldShareFiles(t *testing.T) {
+	blobs := newFakeBlobStore()
+	s := store.New(blobs)
+	if err := publishBaseline(t, s, "a.example/CAT-1"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	before := map[string]string{}
+	for p, b := range blobs.data {
+		before[p] = string(b)
+	}
+
+	for _, id := range []string{"b.example/CAT-1", "a.example/cat-1", "a.example/CAT 2", "a.example/"} {
+		err := publishBaseline(t, s, id)
+		if !errors.Is(err, store.ErrCatalogIDNotAllowed) {
+			t.Errorf("Publish(%q) = %v, want ErrCatalogIDNotAllowed", id, err)
+		}
+	}
+	// Two new ids in one request.
+	content := baselineFile(t, "x", json.RawMessage(`{"id":"x","descriptor":{"name":"x"}}`), time.Now().Add(time.Hour))
+	err := s.Publish(context.Background(), store.PublishRequest{NodeID: "example.test", Updates: []store.CatalogUpdate{
+		{CatalogID: "a.example/NEW", SignedEntry: json.RawMessage(`{"catalogId":"a.example/NEW"}`), Baseline: &store.FileWrite{Version: 1, Content: content}},
+		{CatalogID: "b.example/NEW", SignedEntry: json.RawMessage(`{"catalogId":"b.example/NEW"}`), Baseline: &store.FileWrite{Version: 1, Content: content}},
+	}})
+	if !errors.Is(err, store.ErrCatalogIDNotAllowed) {
+		t.Errorf("two new ids sharing file names: Publish = %v, want ErrCatalogIDNotAllowed", err)
+	}
+
+	if len(blobs.data) != len(before) {
+		t.Errorf("a refused publish wrote files: %d blobs, had %d", len(blobs.data), len(before))
+	}
+	for p, b := range before {
+		if string(blobs.data[p]) != b {
+			t.Errorf("%s changed", p)
+		}
+	}
+
+	// An id already in the index is not re-checked: it can be updated.
+	if err := publishBaseline(t, s, "a.example/CAT-1"); err != nil {
+		t.Errorf("update of an existing id: %v", err)
 	}
 }

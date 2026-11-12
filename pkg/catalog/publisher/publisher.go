@@ -28,6 +28,7 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/beckn/catalog-core/pkg/catalog"
 	"github.com/beckn/catalog-core/pkg/catalog/store"
@@ -224,7 +225,7 @@ type Outcome struct {
 // must not fail the whole publish call.
 type PublishError struct {
 	CatalogID string
-	Stage     string // "validate" | "diff" | "retire"
+	Stage     string // "validate" | "load" | "diff" | "retire"
 	Reason    string
 	Fatal     bool
 }
@@ -298,12 +299,17 @@ func Publish(ctx context.Context, p Params) (Result, error) {
 	}
 
 	handled := make(map[string]bool, len(p.Catalogs))
+	// claimed records, by store.FileNameKey, which catalogId this call has
+	// already agreed to write files for -- so two ids in one call cannot
+	// both be given the same file names (see admit).
+	claimed := make(map[string]string, len(p.Catalogs))
 
 	for _, sub := range p.Catalogs {
 		if handled[sub.CatalogID] {
 			continue // first entry for a catalogId in one call wins; later duplicates are ignored
 		}
 		handled[sub.CatalogID] = true
+		prior := p.PriorState[sub.CatalogID]
 
 		if sub.Directives.Retire {
 			if err := p.retireOne(ctx, sub.CatalogID, now, fileNextUpdate, &result); err != nil {
@@ -317,8 +323,14 @@ func Publish(ctx context.Context, p Params) (Result, error) {
 			result.Errors = append(result.Errors, PublishError{CatalogID: sub.CatalogID, Stage: "validate", Reason: err.Error()})
 			continue
 		}
+		if stage, err := admit(sub, prior, claimed); err != nil {
+			log.WarnContext(ctx, "catalog/publisher: submission rejected", "catalogId", sub.CatalogID, "stage", stage, "reason", err.Error())
+			result.Errors = append(result.Errors, PublishError{CatalogID: sub.CatalogID, Stage: stage, Reason: err.Error()})
+			continue
+		}
+		claimed[store.FileNameKey(sub.CatalogID)] = sub.CatalogID
 
-		oc, entry, err := p.publishOne(ctx, sub, p.PriorState[sub.CatalogID], fileNextUpdate)
+		oc, entry, err := p.publishOne(ctx, sub, prior, fileNextUpdate)
 		if err != nil {
 			log.WarnContext(ctx, "catalog/publisher: submission rejected", "catalogId", sub.CatalogID, "stage", "diff", "reason", err.Error())
 			result.Errors = append(result.Errors, PublishError{CatalogID: sub.CatalogID, Stage: "diff", Reason: err.Error()})
@@ -359,12 +371,108 @@ func Publish(ctx context.Context, p Params) (Result, error) {
 	return result, nil
 }
 
+// admit decides whether a structurally valid submission may be published
+// under its catalogId at all, given what the index already holds for that
+// id (prior) and which file names this call has already given out
+// (claimed). It returns the PublishError stage and reason for a refusal.
+//
+// These are the identity rules, checked before anything is diffed or
+// signed, so a refused submission leaves the index and every file exactly
+// as they were:
+//
+//   - A retired catalogId is never published again (NFH-014 CON-TBD-05,
+//     CON-TBD-26). Doing so would un-retire the entry, restart
+//     baseline.version (CON-TBD-04) and overwrite the retired catalog's
+//     immutable files (CON-TBD-23).
+//   - A catalog whose published content cannot be read back cannot be
+//     diffed; only an explicit ForceBaseline (or a retire) moves it on.
+//   - A catalogId that has no index entry yet must be usable as a file
+//     name and URL (store.ValidateCatalogID), and its file names must not
+//     already belong to another catalogId, in the index or earlier in this
+//     call. File names come from the id's last path segment only, so
+//     "a.example/CAT-1" and "b.example/CAT-1" would be one set of files.
+//   - A catalogId that is in the index, and shares its file names with
+//     another entry that is still live, is refused too: that index was
+//     written before this was checked, and every publish of either one
+//     overwrites the other. Once the other one is retired, this one can be
+//     published again.
+//
+// A catalogId that already has an index entry is otherwise not re-checked:
+// it keeps its id, file names and URLs whatever they look like.
+func admit(sub Submission, prior store.CatalogState, claimed map[string]string) (stage string, err error) {
+	id := sub.CatalogID
+	if prior.Retired {
+		return "validate", fmt.Errorf("catalogId %q is retired and cannot be published again (NFH-014 CON-TBD-26); publish this catalog under a new catalogId", id)
+	}
+	if prior.Unreadable != "" && !sub.Directives.ForceBaseline {
+		return "load", fmt.Errorf("the published content of catalogId %q cannot be read back, so there is nothing to compare this submission with (%s); publish it with forceBaseline to start from a new baseline, or retire it", id, prior.Unreadable)
+	}
+	if !prior.Known() {
+		if err := store.ValidateCatalogID(id); err != nil {
+			return "validate", err
+		}
+		if len(prior.NameConflicts) > 0 {
+			return "validate", fmt.Errorf("catalogId %q would be stored under the same file names as %q, which is already in the catalog index (file names come from the text after the last \"/\" of the id, compared without regard to case); use a catalogId whose last segment is different", id, prior.NameConflicts[0].CatalogID)
+		}
+	} else {
+		for _, c := range prior.NameConflicts {
+			if !c.Retired {
+				return "validate", fmt.Errorf("catalogId %q shares its file names with %q, which is also published, so each one's files overwrite the other's; retire one of them, then publish the other with forceBaseline", id, c.CatalogID)
+			}
+		}
+	}
+	if other, taken := claimed[store.FileNameKey(id)]; taken && other != id {
+		return "validate", fmt.Errorf("catalogId %q would be stored under the same file names as %q, which is published in the same call (file names come from the text after the last \"/\" of the id, compared without regard to case); use a catalogId whose last segment is different", id, other)
+	}
+	return "", nil
+}
+
+// shortID cuts an id that is not in the index -- and so can be anything a
+// caller sent, of any length -- down to something that fits in an error
+// message and a log line.
+func shortID(id string) string {
+	const limit = 120
+	if len(id) <= limit {
+		return id
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(id[cut]) {
+		cut--
+	}
+	return id[:cut] + "..."
+}
+
+// sharesFilesWithLiveCatalog reports whether another, still live index
+// entry is written under the same file names as this one.
+func sharesFilesWithLiveCatalog(prior store.CatalogState) (string, bool) {
+	for _, c := range prior.NameConflicts {
+		if !c.Retired {
+			return c.CatalogID, true
+		}
+	}
+	return "", false
+}
+
 // retireOne signs a tombstone entry for id, replacing whatever entry was
 // there -- prior CatalogType/NetworkIds/SchemaTypes/EntryVersion still
 // come from PriorState[id], only isActive/baseline/changes are dropped.
+//
+// Only a catalogId that has an index entry can be retired. One that was
+// never published (or is misspelt, or empty) is reported as a "retire"
+// PublishError and nothing is signed: a tombstone is a permanent, signed
+// statement that a catalog existed and was withdrawn.
 func (p Params) retireOne(ctx context.Context, id string, now time.Time, fileNextUpdate time.Time, result *Result) error {
 	log := p.logger()
 	prior := p.PriorState[id]
+	if !prior.Known() {
+		reason := fmt.Sprintf("catalog not found: catalogId %q is not in the catalog index, so there is nothing to retire", shortID(id))
+		if id == "" {
+			reason = "catalog not found: missing catalogId"
+		}
+		log.WarnContext(ctx, "catalog/publisher: retire rejected", "catalogId", id, "stage", "retire", "reason", reason)
+		result.Errors = append(result.Errors, PublishError{CatalogID: id, Stage: "retire", Reason: reason})
+		return nil
+	}
 	// Retirement is one-way and happens once (NFH-014 CON-TBD-05): the
 	// tombstone already in the index is authoritative. Signing a second
 	// one would move retiredAt, so it no longer matches the final
@@ -395,7 +503,17 @@ func (p Params) retireOne(ctx context.Context, id string, now time.Time, fileNex
 	// gone. Independent of today's PublishLatest: this is cleaning up a
 	// file that already exists, not deciding whether to start publishing
 	// a new one.
-	if prior.LatestPublished {
+	//
+	// The exception is an index that already holds another live catalog
+	// under the same file names (see admit): the "latest" file at that
+	// name is the other catalog's as much as this one's, and writing a
+	// tombstone into it would tell the other catalog's consumers that it
+	// was retired.
+	sharedWith, shared := sharesFilesWithLiveCatalog(prior)
+	if shared {
+		log.WarnContext(ctx, "catalog/publisher: not writing a final latest tombstone, the file is shared with a live catalog", "catalogId", id, "sharedWith", sharedWith)
+	}
+	if prior.LatestPublished && !shared {
 		if prior.Catalog == nil {
 			log.WarnContext(ctx, "catalog/publisher: cannot write final latest tombstone, prior catalog content missing", "catalogId", id)
 			result.Errors = append(result.Errors, PublishError{
@@ -810,20 +928,40 @@ func (p Params) compactionDue(ctx context.Context, catalogID string, prior store
 }
 
 // validateSubmission applies a shallow structural check: a Beckn Catalog
-// object has no context/message envelope, just {id, descriptor, ...}.
+// object has no context/message envelope, just {id, descriptor, ...}. It
+// also checks the two inputs that decide the entry's lifecycle state and
+// crawl order, so that a value that cannot be read is refused rather than
+// silently replaced by a default: catalog.isActive must be a boolean when
+// present (a "false" in quotes would otherwise publish a catalog meant to
+// be paused as ACTIVE), and CatalogType must be REGULAR, MASTER or empty.
+//
+// Whether the catalogId itself may be used is decided separately, by admit,
+// because that depends on what is already published.
 func validateSubmission(sub Submission) error {
 	if sub.CatalogID == "" {
 		return fmt.Errorf("missing catalogId")
 	}
+	switch sub.CatalogType {
+	case "", "REGULAR", "MASTER":
+	default:
+		return fmt.Errorf("invalid catalogType %q (must be \"REGULAR\" or \"MASTER\")", sub.CatalogType)
+	}
 	var c struct {
 		ID         string          `json:"id"`
 		Descriptor json.RawMessage `json:"descriptor"`
+		IsActive   json.RawMessage `json:"isActive"`
 	}
 	if err := json.Unmarshal(sub.Catalog, &c); err != nil {
 		return fmt.Errorf("invalid catalog JSON: %w", err)
 	}
 	if c.ID == "" || len(c.Descriptor) == 0 {
 		return fmt.Errorf("catalog missing id/descriptor")
+	}
+	if len(c.IsActive) > 0 && string(c.IsActive) != "null" {
+		var b bool
+		if err := json.Unmarshal(c.IsActive, &b); err != nil {
+			return fmt.Errorf("catalog isActive must be true or false, got %s", c.IsActive)
+		}
 	}
 	return nil
 }
