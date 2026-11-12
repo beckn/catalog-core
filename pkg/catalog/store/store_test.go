@@ -1,6 +1,8 @@
 package store_test
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -438,4 +440,108 @@ func TestPublish_RefusesNewIdThatWouldShareFiles(t *testing.T) {
 	if err := publishBaseline(t, s, "a.example/CAT-1"); err != nil {
 		t.Errorf("update of an existing id: %v", err)
 	}
+}
+
+// TestLoad_CarriesPriorLatestReferenceAndStoredFiles: the prior state must
+// say what "latest" was published as (the entry's own reference) and what
+// the blob store holds under both "latest" names -- including a file the
+// entry does not list, an unservable one, and not another catalog's.
+func TestLoad_CarriesPriorLatestReferenceAndStoredFiles(t *testing.T) {
+	blobs := newFakeBlobStore()
+	s := store.New(blobs)
+	ctx := context.Background()
+	const id = "example.test/CAT-1"
+
+	cat := json.RawMessage(`{"id":"CAT-1","descriptor":{"name":"Test"}}`)
+	content := baselineFile(t, id, cat, time.Now().Add(time.Hour))
+	entry := json.RawMessage(`{"catalogId":"` + id + `","entryVersion":1,"catalogType":"REGULAR","isActive":true,` +
+		`"baseline":{"version":1,"url":"https://example.test/catalogs/CAT-1.v1.json","size":1,"digest":"sha-256:x"},` +
+		`"latest":{"version":1,"url":"https://example.test/catalogs/CAT-1.latest.json","size":7,"digest":"sha-256:y"}}`)
+	if err := s.Publish(ctx, store.PublishRequest{NodeID: "example.test", Updates: []store.CatalogUpdate{{
+		CatalogID: id, SignedEntry: entry,
+		Baseline: &store.FileWrite{Version: 1, Content: content},
+		Latest:   &store.FileWrite{Version: 1, Content: content},
+	}}}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	load := func() store.CatalogState {
+		t.Helper()
+		states, err := s.LoadCatalogs(ctx, []string{id})
+		if err != nil {
+			t.Fatalf("LoadCatalogs: %v", err)
+		}
+		return states[id]
+	}
+
+	st := load()
+	if st.LatestFile == nil || st.LatestFile.URL != "https://example.test/catalogs/CAT-1.latest.json" || st.LatestFile.Digest != "sha-256:y" || !st.LatestPublished {
+		t.Fatalf("LatestFile = %+v, want the entry's own latest reference", st.LatestFile)
+	}
+	if len(st.StoredLatest) != 1 || st.StoredLatest[0].Compressed || !st.StoredLatest[0].Readable ||
+		string(st.StoredLatest[0].Content) != string(content) || st.StoredLatest[0].Version != 1 || st.StoredLatest[0].RetiredAt != nil {
+		t.Fatalf("StoredLatest = %+v, want the one plain file, readable", st.StoredLatest)
+	}
+
+	// Plain bytes under the .gz name: present, not servable as named.
+	blobs.data[store.LatestFilePath(id, true)] = content
+	st = load()
+	if got := st.Stored(true); got == nil || got.Readable {
+		t.Errorf("Stored(true) = %+v, want present and not readable", got)
+	}
+	// Another catalog's file under this catalog's name is not this
+	// catalog's to rewrite.
+	other := baselineFile(t, "other.test/CAT-1", cat, time.Now().Add(time.Hour))
+	blobs.data[store.LatestFilePath(id, true)] = gzipBytes(t, other)
+	if got := load().Stored(true); got != nil {
+		t.Errorf("Stored(true) = %+v, want another catalog's file left out", got)
+	}
+	delete(blobs.data, store.LatestFilePath(id, true))
+
+	// Retired: the state carries the tombstone as stored, its retiredAt,
+	// and still the stored latest files.
+	tomb := json.RawMessage(`{"catalogId":"` + id + `","entryVersion":2,"catalogType":"REGULAR","retiredAt":"2026-11-12T10:00:00Z"}`)
+	if err := s.Publish(ctx, store.PublishRequest{NodeID: "example.test", Retirements: []store.CatalogUpdate{{CatalogID: id, SignedEntry: tomb}}}); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	st = load()
+	if !st.Retired || st.RetiredAt != "2026-11-12T10:00:00Z" || string(st.SignedEntry) != string(tomb) {
+		t.Errorf("retired state = %+v, want RetiredAt and SignedEntry from the tombstone", st)
+	}
+	if len(st.StoredLatest) != 1 || st.LatestFile != nil {
+		t.Errorf("retired state: StoredLatest=%d LatestFile=%v, want the stored file and no reference", len(st.StoredLatest), st.LatestFile)
+	}
+}
+
+// TestPublish_LatestAlt_WritesBothLatestNames: a retirement can carry the
+// final tombstone for both "latest" names.
+func TestPublish_LatestAlt_WritesBothLatestNames(t *testing.T) {
+	blobs := newFakeBlobStore()
+	s := store.New(blobs)
+	const id = "example.test/CAT-1"
+	plain := []byte(`{"catalogId":"example.test/CAT-1","retiredAt":"2026-11-12T10:00:00Z"}`)
+	zipped := gzipBytes(t, plain)
+	err := s.Publish(context.Background(), store.PublishRequest{NodeID: "example.test", Retirements: []store.CatalogUpdate{{
+		CatalogID: id, SignedEntry: json.RawMessage(`{"catalogId":"example.test/CAT-1","retiredAt":"2026-11-12T10:00:00Z"}`),
+		Latest:    &store.FileWrite{Content: plain, ServedContent: zipped, Compressed: true},
+		LatestAlt: &store.FileWrite{Content: plain, ServedContent: plain},
+	}}})
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if string(blobs.data[store.LatestFilePath(id, true)]) != string(zipped) || string(blobs.data[store.LatestFilePath(id, false)]) != string(plain) {
+		t.Errorf("latest files = %v, want both names written", blobs.data)
+	}
+}
+
+func gzipBytes(t *testing.T, b []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(b); err != nil {
+		t.Fatalf("gzip: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip: %v", err)
+	}
+	return buf.Bytes()
 }
