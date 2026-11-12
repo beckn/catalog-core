@@ -175,6 +175,12 @@ type CatalogUpdate struct {
 	Baseline *FileWrite
 	Change   *FileWrite
 	Latest   *FileWrite
+
+	// LatestAlt is a second "latest" write, under the other encoding's
+	// name than Latest. Set only on a retirement of a catalog that has
+	// "latest" files under both names, each of which needs the final
+	// tombstone.
+	LatestAlt *FileWrite
 }
 
 // PublishRequest is one publish call's outcome to persist. NodeID/
@@ -479,6 +485,11 @@ func (s *Store) writeCatalogFiles(ctx context.Context, u CatalogUpdate) error {
 	}
 	if u.Latest != nil {
 		if err := s.writeFile(ctx, LatestFilePath(u.CatalogID, u.Latest.Compressed), u.Latest); err != nil {
+			return err
+		}
+	}
+	if u.LatestAlt != nil {
+		if err := s.writeFile(ctx, LatestFilePath(u.CatalogID, u.LatestAlt.Compressed), u.LatestAlt); err != nil {
 			return err
 		}
 	}

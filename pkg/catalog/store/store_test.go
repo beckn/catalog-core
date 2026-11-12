@@ -1,6 +1,8 @@
 package store_test
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"testing"
@@ -304,4 +306,38 @@ func TestPublish_RetiredLatest_WritesFinalTombstone(t *testing.T) {
 	if _, err := blobs.Get(ctx, path); err != nil {
 		t.Errorf("expected latest tombstone at %s: %v", path, err)
 	}
+}
+
+// TestPublish_LatestAlt_WritesBothLatestNames: a retirement can carry the
+// final tombstone for both "latest" names.
+func TestPublish_LatestAlt_WritesBothLatestNames(t *testing.T) {
+	blobs := newFakeBlobStore()
+	s := store.New(blobs)
+	const id = "example.test/CAT-1"
+	plain := []byte(`{"catalogId":"example.test/CAT-1","retiredAt":"2026-11-12T10:00:00Z"}`)
+	zipped := gzipBytes(t, plain)
+	err := s.Publish(context.Background(), store.PublishRequest{NodeID: "example.test", Retirements: []store.CatalogUpdate{{
+		CatalogID: id, SignedEntry: json.RawMessage(`{"catalogId":"example.test/CAT-1","retiredAt":"2026-11-12T10:00:00Z"}`),
+		Latest:    &store.FileWrite{Content: plain, ServedContent: zipped, Compressed: true},
+		LatestAlt: &store.FileWrite{Content: plain, ServedContent: plain},
+	}}})
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if string(blobs.data[store.LatestFilePath(id, true)]) != string(zipped) || string(blobs.data[store.LatestFilePath(id, false)]) != string(plain) {
+		t.Errorf("latest files = %v, want both names written", blobs.data)
+	}
+}
+
+func gzipBytes(t *testing.T, b []byte) []byte {
+	t.Helper()
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	if _, err := zw.Write(b); err != nil {
+		t.Fatalf("gzip: %v", err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatalf("gzip: %v", err)
+	}
+	return buf.Bytes()
 }
