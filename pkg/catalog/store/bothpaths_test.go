@@ -324,3 +324,90 @@ func TestBothPaths_UnreadableIndexFailsWithAUsableError(t *testing.T) {
 		})
 	}
 }
+
+// After a re-baseline the entry keeps listing the change files that led up
+// to it (NFH-014 CON-TBD-32). The state Store reconstructs is the new
+// baseline alone: those older changes are not applied on top of it. They
+// stay in ChangeFiles until the baseline's own next_update has passed, and
+// are dropped from it afterwards. A change published after the baseline is
+// applied as always.
+func TestLoad_SupersededChangeFilesAreListedForTheGracePeriodButNotApplied(t *testing.T) {
+	const id = "example.test/CAT-1"
+	for _, tc := range []struct {
+		name               string
+		baselineNextUpdate time.Time
+		wantListed         []int64 // toVersion of each change file in the state
+	}{
+		{"within the grace period", time.Now().Add(time.Hour), []int64{2, 4}},
+		{"after the grace period", time.Now().Add(-time.Hour), []int64{4}},
+	} {
+		eachStoreKind(t, func(t *testing.T, shared *sharedBlobs, open func() *store.Store) {
+			t.Run(tc.name, func(t *testing.T) {
+				s := open()
+				ctx := context.Background()
+				put := func(u store.CatalogUpdate) {
+					t.Helper()
+					if err := s.Publish(ctx, store.PublishRequest{NodeID: "example.test", Updates: []store.CatalogUpdate{u}}); err != nil {
+						t.Fatalf("Publish: %v", err)
+					}
+				}
+				body := func(items string) json.RawMessage {
+					return json.RawMessage(`{"id":"CAT-1","descriptor":{},"provider":{},"resources":[` + items + `]}`)
+				}
+				ref := func(kind string, v int64) string {
+					dir := "catalogs/"
+					if kind == "changes.json" {
+						dir = "catalogs/changes/"
+					}
+					return fmt.Sprintf(`"url":"https://example.test/%sCAT-1.v%d.%s","size":1,"digest":"sha-256:x"`, dir, v, kind)
+				}
+				change2 := `{"fromVersion":1,"toVersion":2,` + ref("changes.json", 2) + `}`
+				change4 := `{"fromVersion":3,"toVersion":4,` + ref("changes.json", 4) + `}`
+				entry := func(ev, baseline int64, changes string) json.RawMessage {
+					return json.RawMessage(fmt.Sprintf(`{"catalogId":%q,"entryVersion":%d,"catalogType":"REGULAR","isActive":true,"baseline":{"version":%d,%s},"changes":[%s]}`,
+						id, ev, baseline, ref("json", baseline), changes))
+				}
+				// v1: A=one. v2 (change): A=two, B added.
+				put(store.CatalogUpdate{CatalogID: id, SignedEntry: entry(1, 1, ""),
+					Baseline: &store.FileWrite{Version: 1, Content: baselineFile(t, id, body(`{"id":"A","n":"one"}`), time.Now().Add(time.Hour))}})
+				put(store.CatalogUpdate{CatalogID: id, SignedEntry: entry(2, 1, change2),
+					Change: &store.FileWrite{Version: 2, Content: json.RawMessage(`{"catalogId":"example.test/CAT-1","fromVersion":1,"toVersion":2,"next_update":"2099-01-01T00:00:00Z","resources":{"upserts":[{"id":"A","n":"two"},{"id":"B","n":"b"}]},"offers":{}}`)}})
+				// v3 (re-baseline): A=three, B gone. The v2 change stays listed.
+				put(store.CatalogUpdate{CatalogID: id, SignedEntry: entry(3, 3, change2),
+					Baseline: &store.FileWrite{Version: 3, Content: baselineFile(t, id, body(`{"id":"A","n":"three"}`), tc.baselineNextUpdate)}})
+
+				states, err := s.LoadCatalogs(ctx, []string{id})
+				if err != nil {
+					t.Fatalf("LoadCatalogs: %v", err)
+				}
+				if got := string(states[id].Catalog); got != string(body(`{"id":"A","n":"three"}`)) {
+					t.Errorf("state after the re-baseline is not the baseline:\n got %s", got)
+				}
+
+				// v4 (change after the baseline): C added.
+				put(store.CatalogUpdate{CatalogID: id, SignedEntry: entry(4, 3, change2+","+change4),
+					Change: &store.FileWrite{Version: 4, Content: json.RawMessage(`{"catalogId":"example.test/CAT-1","fromVersion":3,"toVersion":4,"next_update":"2099-01-01T00:00:00Z","resources":{"upserts":[{"id":"C","n":"c"}]},"offers":{}}`)}})
+				states, err = s.LoadCatalogs(ctx, []string{id})
+				if err != nil {
+					t.Fatalf("LoadCatalogs: %v", err)
+				}
+				var got struct {
+					Resources []struct{ ID, N string } `json:"resources"`
+				}
+				if err := json.Unmarshal(states[id].Catalog, &got); err != nil {
+					t.Fatal(err)
+				}
+				if len(got.Resources) != 2 || got.Resources[0].ID != "A" || got.Resources[0].N != "three" || got.Resources[1].ID != "C" {
+					t.Errorf("state = %s, want A=three and C", states[id].Catalog)
+				}
+				var listed []int64
+				for _, ch := range states[id].ChangeFiles {
+					listed = append(listed, ch.EffectiveVersion())
+				}
+				if fmt.Sprint(listed) != fmt.Sprint(tc.wantListed) {
+					t.Errorf("change files listed in the state: %v, want %v", listed, tc.wantListed)
+				}
+			})
+		})
+	}
+}
