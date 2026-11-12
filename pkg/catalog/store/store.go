@@ -735,23 +735,42 @@ func (s *Store) reconstructState(ctx context.Context, entry catalog.CatalogEntry
 	}
 
 	// A change file's EffectiveVersion is only ever <= the current
-	// baseline's own Version right after a forced re-baseline
-	// (compaction): every other baseline is created once, before any of
+	// baseline's own Version right after a re-baseline (a forced one, or
+	// a compaction): every other baseline is created once, before any of
 	// its changes[], so all of its changes carry strictly higher
-	// versions. Such a "superseded" change's content is already folded
-	// into the baseline itself -- applying it again is a harmless no-op
-	// -- but it only needs to stay *listed* for one full next_update
-	// cycle after the compaction, measured against the next_update
-	// stamped on the new baseline at compaction time (wrapped.NextUpdate
-	// here). Once that's elapsed, dropping it from the returned
-	// ChangeFiles is what actually realizes compaction's index-payload
-	// benefit -- this is Store's own retention rule, derived purely from
-	// data already on disk, not a separate config knob.
+	// versions. Such a "superseded" change describes how to get from an
+	// older version to one the new baseline has already replaced. It is
+	// not part of the catalog's current content and is never applied
+	// here: the new baseline is whatever was submitted when it was made,
+	// which need not be what the older changes add up to, so applying
+	// them on top would put back a resource the baseline dropped or an
+	// older value of one it changed -- and the next submission would be
+	// diffed against content no consumer was served.
+	//
+	// It only needs to stay *listed* for one full next_update cycle after
+	// the re-baseline (NFH-014 CON-TBD-32), measured against the
+	// next_update stamped on the new baseline (wrapped.NextUpdate here),
+	// so a consumer part-way through the old lineage can still reach the
+	// baseline's version. Once that has elapsed, dropping it from the
+	// returned ChangeFiles is what realizes compaction's index-payload
+	// benefit -- Store's own retention rule, derived purely from data
+	// already on disk, not a separate config knob.
 	gracePeriodElapsed := time.Now().After(wrapped.NextUpdate)
 
 	effective := wrapped.Catalog
 	changeFiles := make([]catalog.FileEntry, 0, len(entry.Changes))
 	for _, ch := range entry.Changes {
+		if ch.EffectiveVersion() <= entry.Baseline.Version {
+			if gracePeriodElapsed {
+				s.log.DebugContext(ctx, "catalogstore: dropping superseded change file (grace period elapsed)",
+					"catalogId", entry.CatalogID, "fromVersion", ch.FromVersion, "toVersion", ch.ToVersion)
+				continue // grace period over: stop listing this pre-baseline change file
+			}
+			s.log.DebugContext(ctx, "catalogstore: keeping superseded change file listed, not applied", "catalogId", entry.CatalogID,
+				"fromVersion", ch.FromVersion, "toVersion", ch.ToVersion)
+			changeFiles = append(changeFiles, ch)
+			continue
+		}
 		chGzip := isGzipEncoded(ch)
 		chPath := CatalogFilePath(entry.CatalogID, ch.EffectiveVersion(), "changes.json", chGzip)
 		raw, err := s.getContent(ctx, chPath)
@@ -768,14 +787,8 @@ func (s *Store) reconstructState(ctx context.Context, entry catalog.CatalogEntry
 		if err != nil {
 			return nil, &unreadableError{fmt.Errorf("catalogstore: applying %s: %w", chPath, err)}
 		}
-		superseded := ch.EffectiveVersion() <= entry.Baseline.Version
-		if superseded && gracePeriodElapsed {
-			s.log.DebugContext(ctx, "catalogstore: dropping superseded change file (grace period elapsed)",
-				"catalogId", entry.CatalogID, "fromVersion", ch.FromVersion, "toVersion", ch.ToVersion)
-			continue // grace period over: stop listing this pre-compaction change file
-		}
 		s.log.DebugContext(ctx, "catalogstore: applied change file", "catalogId", entry.CatalogID,
-			"fromVersion", ch.FromVersion, "toVersion", ch.ToVersion, "superseded", superseded)
+			"fromVersion", ch.FromVersion, "toVersion", ch.ToVersion)
 		changeFiles = append(changeFiles, ch)
 	}
 
