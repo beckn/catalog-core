@@ -139,15 +139,80 @@ type CatalogState struct {
 	// had one still needs a final write to that same stable URL.
 	LatestPublished bool
 
+	// LatestFile is the prior index entry's own "latest" reference,
+	// verbatim (nil when the entry has none). "latest" is the one file
+	// overwritten in place at a stable URL, so its name, encoding, digest
+	// and version must come from what was last published -- never from
+	// the current call's Gzip/PublishLatest settings, which may have
+	// changed since. LatestPublished is LatestFile != nil.
+	LatestFile *catalog.FileEntry
+
+	// StoredLatest lists every "latest" file the blob store holds for
+	// this catalog, under either of its two possible names
+	// (LatestFilePath compressed and uncompressed), whether or not the
+	// index entry still references it. A file can outlive its reference:
+	// PublishLatest was switched off, the catalog was retired (a
+	// tombstone entry never lists "latest"), or an earlier release wrote
+	// it under the other name. A consumer may still hold that URL, so
+	// retiring the catalog must reach every one of them (NFH-014
+	// CON-TBD-38).
+	StoredLatest []LatestFileState
+
 	// Retired reports that this catalog's index entry is already a
 	// tombstone (retiredAt set). Such a state carries only what the
 	// tombstone itself does -- EntryVersion, CatalogType, NetworkIds,
-	// SchemaTypes -- and never Catalog/BaselineFile/ChangeFiles: there is
-	// no content left to diff against. It exists so a caller can tell an
-	// already-retired catalog from one that never existed, and so
-	// EntryVersion keeps its lineage (NFH-014 CON-TBD-03) instead of
-	// restarting from zero.
+	// SchemaTypes, RetiredAt -- plus SignedEntry and StoredLatest, and never
+	// Catalog/BaselineFile/ChangeFiles: there is no content left to diff
+	// against. It exists so a caller can tell an already-retired catalog
+	// from one that never existed, and so EntryVersion keeps its lineage
+	// (NFH-014 CON-TBD-03) instead of restarting from zero.
 	Retired bool
+
+	// RetiredAt is the tombstone entry's own retiredAt, verbatim; empty
+	// unless Retired. A final "latest" file written late (a repeat
+	// retire repairing one an earlier call missed) carries this instant,
+	// not a new one.
+	RetiredAt string
+
+	// SignedEntry is the index entry exactly as stored, signature
+	// included. A caller compares a freshly signed entry against it to
+	// tell whether the entry really is unchanged; a repeat retire that has
+	// to repair a "latest" file hands the same tombstone back to
+	// Store.Publish.
+	SignedEntry json.RawMessage
+}
+
+// LatestFileState is one "latest" file as the blob store holds it.
+type LatestFileState struct {
+	// Compressed says which of the two names it is stored under:
+	// "<id>.latest.json.gz" (true) or "<id>.latest.json" (false).
+	Compressed bool
+
+	// Readable is false when the stored bytes are not what a consumer
+	// fetching that name needs: not gzip under the ".gz" name (or gzip
+	// under the plain one), or not a CatalogFile. Every field below is
+	// then empty.
+	Readable bool
+
+	// Content is the canonical (decompressed) signed CatalogFile; its
+	// SHA-256 is what an index entry's latest.digest must equal.
+	Content json.RawMessage
+	// ServedSize is the size of the bytes as stored.
+	ServedSize int64
+
+	Version   int64
+	Catalog   json.RawMessage
+	RetiredAt *time.Time
+}
+
+// Stored returns the StoredLatest file under the given name, or nil.
+func (s CatalogState) Stored(compressed bool) *LatestFileState {
+	for i := range s.StoredLatest {
+		if s.StoredLatest[i].Compressed == compressed {
+			return &s.StoredLatest[i]
+		}
+	}
+	return nil
 }
 
 // FileWrite is one file's content to persist. Version drives the
@@ -277,7 +342,16 @@ func (s *Store) LoadCatalogs(ctx context.Context, catalogIDs []string) (map[stri
 				NetworkIds:   entry.NetworkIDs,
 				SchemaTypes:  entry.SchemaTypes,
 				Retired:      true,
+				RetiredAt:    entry.RetiredAt,
+				SignedEntry:  rawEntry,
 			}
+			stored, err := s.loadStoredLatest(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+			st := result[id]
+			st.StoredLatest = stored
+			result[id] = st
 			continue
 		}
 		if entry.Baseline.URL == "" {
@@ -288,6 +362,10 @@ func (s *Store) LoadCatalogs(ctx context.Context, catalogIDs []string) (map[stri
 		if err != nil {
 			return nil, err
 		}
+		if state.StoredLatest, err = s.loadStoredLatest(ctx, id); err != nil {
+			return nil, err
+		}
+		state.SignedEntry = rawEntry
 		result[id] = *state
 	}
 	s.log.DebugContext(ctx, "catalogstore: LoadCatalogs done", "requested", len(catalogIDs), "reconstructed", len(result))
@@ -395,6 +473,13 @@ func (s *Store) reconstructState(ctx context.Context, entry catalog.CatalogEntry
 		changeFiles = append(changeFiles, ch)
 	}
 
+	if len(changeFiles) == 0 && entry.Changes == nil {
+		// Keep "no change files" in the form the entry has it (null, as a
+		// first baseline is published), so a republish that changes
+		// nothing reproduces the entry byte for byte.
+		changeFiles = nil
+	}
+
 	isActive := true
 	if entry.IsActive != nil {
 		isActive = *entry.IsActive
@@ -416,7 +501,58 @@ func (s *Store) reconstructState(ctx context.Context, entry catalog.CatalogEntry
 		Dependencies:    deps,
 		CrawlHint:       entry.CrawlHint,
 		LatestPublished: entry.Latest != nil,
+		LatestFile:      entry.Latest,
 	}, nil
+}
+
+// loadStoredLatest reads whatever the blob store holds under both of
+// catalogID's "latest" names. Absence is normal and not an error. A file
+// that declares a different catalogId is another catalog's (two ids can
+// share a local name) and is left out: it is not this catalog's to
+// rewrite.
+func (s *Store) loadStoredLatest(ctx context.Context, catalogID string) ([]LatestFileState, error) {
+	var out []LatestFileState
+	for _, compressed := range []bool{true, false} {
+		p := LatestFilePath(catalogID, compressed)
+		raw, err := s.blobs.Get(ctx, p)
+		if errors.Is(err, ErrBlobNotFound) {
+			continue
+		}
+		if err != nil {
+			s.log.ErrorContext(ctx, "catalogstore: reading latest file failed", "catalogId", catalogID, "path", p, "error", err)
+			return nil, fmt.Errorf("catalogstore: reading %s: %w", p, err)
+		}
+		st := LatestFileState{Compressed: compressed, ServedSize: int64(len(raw))}
+		content := raw
+		isGzip := len(raw) >= 2 && raw[0] == 0x1f && raw[1] == 0x8b
+		ok := isGzip == compressed
+		if ok && compressed {
+			if content, err = gunzip(raw); err != nil {
+				ok = false
+			}
+		}
+		var doc struct {
+			CatalogID string          `json:"catalogId"`
+			Version   int64           `json:"version"`
+			Catalog   json.RawMessage `json:"catalog"`
+			RetiredAt *time.Time      `json:"retiredAt"`
+		}
+		if ok && (json.Unmarshal(content, &doc) != nil || doc.CatalogID == "") {
+			ok = false
+		}
+		if ok && doc.CatalogID != catalogID {
+			s.log.WarnContext(ctx, "catalogstore: latest file belongs to another catalog, ignoring", "catalogId", catalogID, "path", p, "fileCatalogId", doc.CatalogID)
+			continue
+		}
+		if ok {
+			st.Readable, st.Content = true, content
+			st.Version, st.Catalog, st.RetiredAt = doc.Version, doc.Catalog, doc.RetiredAt
+		} else {
+			s.log.WarnContext(ctx, "catalogstore: latest file is not servable as named", "catalogId", catalogID, "path", p, "bytes", len(raw))
+		}
+		out = append(out, st)
+	}
+	return out, nil
 }
 
 // --- writes -------------------------------------------------------------
