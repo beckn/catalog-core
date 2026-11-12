@@ -41,6 +41,13 @@ import (
 // from a real backend failure.
 var ErrBlobNotFound = errors.New("catalogstore: blob not found")
 
+// ErrIndexUnreadable is wrapped by the error every read of the index
+// returns when the index file exists but is empty or is not a JSON index
+// document. Nothing can be published until it is restored: writing a new
+// index in its place would drop every catalog it listed and restart their
+// version lineages over files that are meant to be immutable.
+var ErrIndexUnreadable = errors.New("catalogstore: the catalog index file is unreadable")
+
 // BlobStore is the only backend-specific capability a catalog storage
 // backend needs: read/write bytes at a path. It carries no catalog-file
 // vocabulary at all -- every backend (local disk, S3, GCS, git, an
@@ -295,11 +302,20 @@ type CatalogState struct {
 	// Unreadable, when not empty, says why this catalog's published content
 	// could not be reconstructed from its own files (a baseline or change
 	// file is missing or corrupt). Catalog is nil then, but EntryVersion,
-	// the metadata fields, BaselineFile, ChangeFiles and LatestPublished are
-	// still filled in from the index entry, so the catalog can be retired or
-	// given a fresh baseline with its version lineage intact. There is
-	// nothing to diff a submission against.
+	// the metadata fields, BaselineFile, ChangeFiles, LatestPublished,
+	// LatestFile, StoredLatest and SignedEntry are still filled in, so the
+	// catalog can be retired or given a fresh baseline with its version
+	// lineage and its "latest" name intact. There is nothing to diff a
+	// submission against.
 	Unreadable string
+
+	// EntryMalformed is set, together with Unreadable, when the index
+	// entry itself does not parse. Nothing is known about the catalog
+	// then -- not its entryVersion, not its files -- so it can be neither
+	// published (a forced baseline would restart its version lineage and
+	// overwrite files) nor retired until the index entry is repaired.
+	// Only SignedEntry (the raw entry) and NameConflicts are filled in.
+	EntryMalformed bool
 }
 
 // NameConflict is one other index entry that shares a catalogId's file
@@ -472,17 +488,17 @@ type fileEnvelope struct {
 //   - any id, in the index or not, whose file names are also used by
 //     another index entry has NameConflicts set.
 func (s *Store) LoadCatalogs(ctx context.Context, catalogIDs []string) (map[string]CatalogState, error) {
-	result, _, err := s.loadCatalogs(ctx, catalogIDs)
+	result, _, _, err := s.loadCatalogs(ctx, catalogIDs)
 	return result, err
 }
 
 // loadCatalogs is LoadCatalogs, also returning the index entries it read
-// (see LoadForPublish).
-func (s *Store) loadCatalogs(ctx context.Context, catalogIDs []string) (map[string]CatalogState, map[string]json.RawMessage, error) {
+// and their order (see LoadForPublish).
+func (s *Store) loadCatalogs(ctx context.Context, catalogIDs []string) (map[string]CatalogState, map[string]json.RawMessage, []string, error) {
 	s.log.DebugContext(ctx, "catalogstore: LoadCatalogs", "requested", len(catalogIDs))
 	entries, order, err := s.readIndexEntries(ctx)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	owners := nameOwners(entries, order)
 
@@ -501,7 +517,22 @@ func (s *Store) loadCatalogs(ctx context.Context, catalogIDs []string) (map[stri
 		}
 		var entry catalog.CatalogEntry
 		if err := json.Unmarshal(rawEntry, &entry); err != nil {
-			return nil, nil, fmt.Errorf("catalogstore: parsing entry for %s: %w", id, err)
+			// The entry is in the index (parseIndex read its catalogId) but
+			// is not an index entry. That is this catalog's problem only.
+			s.log.ErrorContext(ctx, "catalogstore: index entry cannot be parsed", "catalogId", id, "error", err)
+			result[id] = CatalogState{
+				Unreadable:     fmt.Sprintf("catalogstore: the index entry for %s cannot be parsed: %v", id, err),
+				EntryMalformed: true,
+				SignedEntry:    rawEntry,
+				NameConflicts:  conflicts,
+			}
+			continue
+		}
+		// Every "latest" file the blob store holds for this catalog,
+		// whatever state its entry is in: retiring it has to reach them.
+		stored, err := s.loadStoredLatest(ctx, id)
+		if err != nil {
+			return nil, nil, nil, err
 		}
 		if entry.IsRetired() {
 			s.log.DebugContext(ctx, "catalogstore: catalog already retired, returning tombstone state", "catalogId", id, "entryVersion", entry.EntryVersion)
@@ -513,15 +544,9 @@ func (s *Store) loadCatalogs(ctx context.Context, catalogIDs []string) (map[stri
 				Retired:       true,
 				RetiredAt:     entry.RetiredAt,
 				SignedEntry:   rawEntry,
+				StoredLatest:  stored,
 				NameConflicts: conflicts,
 			}
-			stored, err := s.loadStoredLatest(ctx, id)
-			if err != nil {
-				return nil, nil, err
-			}
-			st := result[id]
-			st.StoredLatest = stored
-			result[id] = st
 			continue
 		}
 		if entry.Baseline.URL == "" {
@@ -533,6 +558,8 @@ func (s *Store) loadCatalogs(ctx context.Context, catalogIDs []string) (map[stri
 			state := entryLevelState(entry)
 			state.NameConflicts = conflicts
 			if state.Known() {
+				state.SignedEntry = rawEntry
+				state.StoredLatest = stored
 				result[id] = state
 			}
 			continue
@@ -545,24 +572,20 @@ func (s *Store) loadCatalogs(ctx context.Context, catalogIDs []string) (map[stri
 			baseline := entry.Baseline
 			broken.BaselineFile = &baseline
 			broken.ChangeFiles = entry.Changes
-			broken.LatestPublished = entry.Latest != nil
 			broken.Unreadable = err.Error()
-			broken.NameConflicts = conflicts
-			result[id] = broken
-			continue
+			state = &broken
+		} else if err != nil {
+			return nil, nil, nil, err
 		}
-		if err != nil {
-			return nil, nil, err
-		}
-		if state.StoredLatest, err = s.loadStoredLatest(ctx, id); err != nil {
-			return nil, nil, err
-		}
+		state.LatestPublished = entry.Latest != nil
+		state.LatestFile = entry.Latest
+		state.StoredLatest = stored
 		state.SignedEntry = rawEntry
 		state.NameConflicts = conflicts
 		result[id] = *state
 	}
 	s.log.DebugContext(ctx, "catalogstore: LoadCatalogs done", "requested", len(catalogIDs), "reconstructed", len(result))
-	return result, entries, nil
+	return result, entries, order, nil
 }
 
 // entryLevelState is the part of a CatalogState that comes from a live
@@ -671,7 +694,8 @@ func (s *Store) readIndexEntries(ctx context.Context) (map[string]json.RawMessag
 func (s *Store) parseIndex(ctx context.Context, raw []byte) (map[string]json.RawMessage, []string, error) {
 	var doc indexDoc
 	if err := json.Unmarshal(raw, &doc); err != nil {
-		return nil, nil, fmt.Errorf("catalogstore: parsing existing index: %w", err)
+		s.log.ErrorContext(ctx, "catalogstore: the index file is unreadable", "path", IndexPath(), "bytes", len(raw), "error", err)
+		return nil, nil, fmt.Errorf("%w: %s holds %d bytes that are not a catalog index (%v); restore it from a copy, nothing can be published until then", ErrIndexUnreadable, IndexPath(), len(raw), err)
 	}
 
 	entries := make(map[string]json.RawMessage, len(doc.Catalogs))
@@ -767,8 +791,6 @@ func (s *Store) reconstructState(ctx context.Context, entry catalog.CatalogEntry
 	state.Catalog = effective
 	state.BaselineFile = &baseline
 	state.ChangeFiles = changeFiles
-	state.LatestPublished = entry.Latest != nil
-	state.LatestFile = entry.Latest
 	return &state, nil
 }
 
@@ -826,7 +848,8 @@ func (s *Store) loadStoredLatest(ctx context.Context, catalogID string) ([]Lates
 
 // Publish merges req's catalog updates and retirements into the existing
 // index, keyed by catalogId, replacing or appending as needed, and
-// persists everything.
+// persists everything. A request with no updates and no retirements
+// writes nothing at all.
 //
 // Over a ConditionalBlobStore the index write is a compare-and-swap,
 // retried with the request merged again whenever another writer got in
@@ -841,6 +864,12 @@ func (s *Store) loadStoredLatest(ctx context.Context, catalogID string) ([]Lates
 // pointing at a file that was never written.
 func (s *Store) Publish(ctx context.Context, req PublishRequest) error {
 	s.log.DebugContext(ctx, "catalogstore: Publish", "nodeId", req.NodeID, "updates", len(req.Updates), "retirements", len(req.Retirements))
+	if len(req.Updates) == 0 && len(req.Retirements) == 0 {
+		// Nothing to merge. Not even the index's next_update moves: a
+		// call that changed nothing must leave nothing changed.
+		s.log.DebugContext(ctx, "catalogstore: nothing to publish, index left as it is")
+		return nil
+	}
 	if cas, ok := s.blobs.(ConditionalBlobStore); ok {
 		return s.publishConditional(ctx, cas, req)
 	}
@@ -850,7 +879,7 @@ func (s *Store) Publish(ctx context.Context, req PublishRequest) error {
 	}
 	// Not atomic with the index write below, but it still catches a
 	// change made between LoadForPublish and here.
-	if ids := req.Base.changed(req, entries); len(ids) > 0 {
+	if ids := req.Base.changed(req, entries, order); len(ids) > 0 {
 		return &ConflictError{CatalogIDs: ids}
 	}
 	// Before anything is written: see checkNewCatalogIDs.

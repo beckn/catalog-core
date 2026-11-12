@@ -74,7 +74,7 @@ func newLifecycleWorld(t *testing.T, gz, latest bool) *lifecycleWorld {
 	t.Cleanup(srv.Close)
 	keys := crawler.StaticKeys(map[string]ed25519.PublicKey{keyID: priv.Public().(ed25519.PublicKey)})
 	return &lifecycleWorld{
-		t: t, ctx: context.Background(), blobs: blobs, srv: srv, store: store.New(blobs),
+		t: t, ctx: context.Background(), blobs: blobs, srv: srv, store: newWorldStore(blobs),
 		fetcher: catalog.NewFetcher(crawler.NewClient(10*time.Second, 10<<20, true), keys, 20<<20),
 		priv:    priv, keyID: keyID, gzip: gz, latest: latest,
 		items: []string{"ITEM-1"}, nets: []string{"net.example"},
@@ -91,9 +91,9 @@ func (w *lifecycleWorld) errorf(format string, a ...any) {
 // persist.
 func (w *lifecycleWorld) call(sub Submission) Result {
 	w.t.Helper()
-	prior, err := w.store.LoadCatalogs(w.ctx, []string{lifecycleID})
+	prior, base, err := w.store.LoadForPublish(w.ctx, []string{lifecycleID})
 	if err != nil {
-		w.t.Fatalf("[%s] LoadCatalogs: %v", w.step, err)
+		w.t.Fatalf("[%s] LoadForPublish: %v", w.step, err)
 	}
 	result, err := Publish(w.ctx, Params{
 		Catalogs: []Submission{sub}, PriorState: prior,
@@ -103,6 +103,7 @@ func (w *lifecycleWorld) call(sub Submission) Result {
 	if err != nil || len(result.Errors) != 0 {
 		w.t.Fatalf("[%s] Publish: err=%v errors=%+v", w.step, err, result.Errors)
 	}
+	result.Publish.Base = base
 	if err := w.store.Publish(w.ctx, result.Publish); err != nil {
 		w.t.Fatalf("[%s] store.Publish: %v", w.step, err)
 	}

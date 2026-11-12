@@ -41,7 +41,7 @@ func newIDWorld(t *testing.T) *idWorld {
 	t.Helper()
 	priv, keyID := testSigningKey(t)
 	blobs := memBlobs{}
-	return &idWorld{t: t, blobs: blobs, s: store.New(blobs), priv: priv, keyID: keyID}
+	return &idWorld{t: t, blobs: blobs, s: newWorldStore(blobs), priv: priv, keyID: keyID}
 }
 
 // call runs one publish call end to end and persists whatever it produced,
@@ -56,9 +56,9 @@ func (w *idWorld) call(subs ...Submission) Result {
 			ids = append(ids, sub.CatalogID)
 		}
 	}
-	prior, err := w.s.LoadCatalogs(ctx, ids)
+	prior, base, err := w.s.LoadForPublish(ctx, ids)
 	if err != nil {
-		w.t.Fatalf("LoadCatalogs: %v", err)
+		w.t.Fatalf("LoadForPublish: %v", err)
 	}
 	result, err := Publish(ctx, Params{
 		Catalogs: subs, PriorState: prior, PublishLatest: true, Gzip: true,
@@ -67,6 +67,7 @@ func (w *idWorld) call(subs ...Submission) Result {
 	if err != nil {
 		w.t.Fatalf("Publish: %v", err)
 	}
+	result.Publish.Base = base
 	if err := w.s.Publish(ctx, result.Publish); err != nil {
 		w.t.Fatalf("store.Publish: %v", err)
 	}

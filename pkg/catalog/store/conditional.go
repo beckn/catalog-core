@@ -80,9 +80,35 @@ type ConditionalBlobStore interface {
 }
 
 // Base records, for each catalogId a caller loaded with LoadForPublish,
-// which index entry (or absence of one) its PublishRequest was computed
-// from. Opaque; pass it back unchanged in PublishRequest.Base.
+// what in the index its PublishRequest was computed from: the catalog's
+// own entry (or the absence of one), and which other entries are stored
+// under the same file names (CatalogState.NameConflicts), since whether
+// an id may be published depends on that too. Opaque; pass it back
+// unchanged in PublishRequest.Base.
+//
+// It does not cover a catalog's "latest" files (CatalogState.StoredLatest).
+// Those are written after the index, so they can change while the entry
+// stays as it is. A request computed from a "latest" that another writer
+// was still bringing up to date rewrites it once more and moves
+// entryVersion on; the file and the entry agree afterwards either way.
 type Base struct{ revisions map[string]string }
+
+// baseRevision identifies everything in the index that the state
+// LoadCatalogs returns for catalogID was derived from.
+func baseRevision(entries map[string]json.RawMessage, owners map[string][]nameOwner, catalogID string) string {
+	rev := entryRevision(entries[catalogID])
+	conflicts := conflictsFor(owners, catalogID)
+	if len(conflicts) == 0 {
+		return rev
+	}
+	shared := make([]string, 0, len(conflicts))
+	for _, c := range conflicts {
+		shared = append(shared, fmt.Sprintf("%s\x00%t", c.CatalogID, c.Retired))
+	}
+	sort.Strings(shared)
+	sum := sha256.Sum256([]byte(rev + "\n" + strings.Join(shared, "\n")))
+	return hex.EncodeToString(sum[:])
+}
 
 // entryRevision identifies one index entry's exact content: "" for no
 // entry, otherwise a hash of its whitespace-normalised bytes.
@@ -102,17 +128,18 @@ func compactJSON(raw []byte) []byte {
 	return buf.Bytes()
 }
 
-// changed returns the catalogIds of req whose current index entry is not
-// the one this Base recorded, sorted.
-func (b *Base) changed(req PublishRequest, entries map[string]json.RawMessage) []string {
+// changed returns the catalogIds of req for which the index no longer
+// holds what this Base recorded, sorted.
+func (b *Base) changed(req PublishRequest, entries map[string]json.RawMessage, order []string) []string {
 	if b == nil {
 		return nil
 	}
+	owners := nameOwners(entries, order)
 	var ids []string
 	check := func(us []CatalogUpdate) {
 		for _, u := range us {
 			want, ok := b.revisions[u.CatalogID]
-			if ok && entryRevision(entries[u.CatalogID]) != want {
+			if ok && baseRevision(entries, owners, u.CatalogID) != want {
 				ids = append(ids, u.CatalogID)
 			}
 		}
@@ -128,13 +155,14 @@ func (b *Base) changed(req PublishRequest, entries map[string]json.RawMessage) [
 // Base, Publish refuses (ErrConflict) to commit an update whose catalog
 // another writer has changed in the meantime.
 func (s *Store) LoadForPublish(ctx context.Context, catalogIDs []string) (map[string]CatalogState, *Base, error) {
-	states, entries, err := s.loadCatalogs(ctx, catalogIDs)
+	states, entries, order, err := s.loadCatalogs(ctx, catalogIDs)
 	if err != nil {
 		return nil, nil, err
 	}
+	owners := nameOwners(entries, order)
 	base := &Base{revisions: make(map[string]string, len(catalogIDs))}
 	for _, id := range catalogIDs {
-		base.revisions[id] = entryRevision(entries[id])
+		base.revisions[id] = baseRevision(entries, owners, id)
 	}
 	return states, base, nil
 }
@@ -242,10 +270,11 @@ func served(fw *FileWrite) []byte {
 // write is the commit point and is a compare-and-swap:
 //
 //  1. read the index with its version; refuse (ErrConflict) if a catalog
-//     of this request is no longer at its Base;
+//     of this request is no longer at its Base, or (checkNewCatalogIDs)
+//     if a new catalogId would be stored over another catalog's files;
 //  2. once per call, write what must exist before the commit: new
 //     baseline and change files, created only if absent, and a
-//     retirement's final "latest" tombstone;
+//     retirement's final "latest" tombstones (one per "latest" name);
 //  3. merge and write the index if its version is unchanged; if it
 //     changed, go back to 1 -- the request's own entries are still valid
 //     as long as step 1 passes, so they are merged again as they are;
@@ -269,10 +298,18 @@ func (s *Store) publishConditional(ctx context.Context, cas ConditionalBlobStore
 			s.rollback(ctx, cas, txn)
 			return err
 		}
-		if ids := req.Base.changed(req, entries); len(ids) > 0 {
+		if ids := req.Base.changed(req, entries, order); len(ids) > 0 {
 			s.rollback(ctx, cas, txn)
 			s.log.WarnContext(ctx, "catalogstore: catalogs changed since they were loaded, caller must recompute", "catalogIds", ids, "attempt", attempt+1)
 			return &ConflictError{CatalogIDs: ids}
+		}
+		// On every attempt, against the index as just read: another writer
+		// may have added the catalog this request's new id would collide
+		// with since the last one.
+		if err := checkNewCatalogIDs(entries, order, req); err != nil {
+			s.rollback(ctx, cas, txn)
+			s.log.ErrorContext(ctx, "catalogstore: publish refused", "error", err)
+			return err
 		}
 		if err := s.writeBeforeCommit(ctx, cas, req, indexVersion, txn); err != nil {
 			if errors.Is(err, errRestart) {
@@ -352,10 +389,13 @@ func mergeIndex(req PublishRequest, entries map[string]json.RawMessage, order []
 // created only if absent, so a writer that goes on to lose never replaces
 // a file some committed entry references.
 //
-// A retirement's final "latest" tombstone is also written first: nothing
-// publishes a retired catalog again, so a tombstone missed after the
-// commit would never be written, whereas one written before a commit that
-// fails is corrected by the retry.
+// A retirement's final "latest" tombstones are also written first. Once
+// the index says "retired", the only call that looks at those files again
+// is a repeated retire; an update's "latest" is put right by any later
+// publish. So the tombstone goes in before the commit, where a commit that
+// then fails is corrected by the retry (or, if the catalog is published
+// again instead, by that publish, which rewrites a "latest" carrying
+// retiredAt under a live entry).
 //
 // An update's "latest" is written after the commit (see afterCommit).
 func (s *Store) writeBeforeCommit(ctx context.Context, cas ConditionalBlobStore, req PublishRequest, indexVersion string, txn *publishTxn) error {
@@ -372,13 +412,25 @@ func (s *Store) writeBeforeCommit(ctx context.Context, cas ConditionalBlobStore,
 		}
 	}
 	for _, r := range req.Retirements {
-		if r.Latest != nil {
-			if err := s.replaceGuarded(ctx, cas, LatestFilePath(r.CatalogID, r.Latest.Compressed), served(r.Latest), txn); err != nil {
+		for _, fw := range latestWrites(r) {
+			if err := s.replaceGuarded(ctx, cas, LatestFilePath(r.CatalogID, fw.Compressed), served(fw), txn); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// latestWrites lists u's "latest" writes: Latest, then LatestAlt.
+func latestWrites(u CatalogUpdate) []*FileWrite {
+	var out []*FileWrite
+	if u.Latest != nil {
+		out = append(out, u.Latest)
+	}
+	if u.LatestAlt != nil {
+		out = append(out, u.LatestAlt)
+	}
+	return out
 }
 
 // createVersioned writes a baseline or change file that must not replace
@@ -492,11 +544,10 @@ func (s *Store) afterCommit(ctx context.Context, cas ConditionalBlobStore, req P
 	// "latest" first: until it is written, a reader of this catalog sees
 	// a latest.digest that does not match the file.
 	for _, u := range req.Updates {
-		if u.Latest == nil {
-			continue
-		}
-		if err := s.writeLatestAfterCommit(ctx, cas, u); err != nil {
-			return err
+		for _, fw := range latestWrites(u) {
+			if err := s.writeLatestAfterCommit(ctx, cas, u, fw); err != nil {
+				return err
+			}
 		}
 	}
 	// A writer that read the index before this commit may have taken one
@@ -528,9 +579,9 @@ func (s *Store) afterCommit(ctx context.Context, cas ConditionalBlobStore, req P
 // index, then writing only if the file has not moved, guarantees that: a
 // writer that has been superseded either sees the newer entry and
 // stops, or loses the conditional write to the newer writer.
-func (s *Store) writeLatestAfterCommit(ctx context.Context, cas ConditionalBlobStore, u CatalogUpdate) error {
-	path := LatestFilePath(u.CatalogID, u.Latest.Compressed)
-	content := served(u.Latest)
+func (s *Store) writeLatestAfterCommit(ctx context.Context, cas ConditionalBlobStore, u CatalogUpdate, fw *FileWrite) error {
+	path := LatestFilePath(u.CatalogID, fw.Compressed)
+	content := served(fw)
 	mine := compactJSON(u.SignedEntry)
 	for attempt := range s.retry.MaxAttempts {
 		current, version, err := getVersioned(ctx, cas, path)
@@ -550,7 +601,7 @@ func (s *Store) writeLatestAfterCommit(ctx context.Context, cas ConditionalBlobS
 		}
 		_, err = cas.PutIfVersion(ctx, path, content, version)
 		if err == nil {
-			s.log.DebugContext(ctx, "catalogstore: wrote file", "path", path, "bytes", len(content), "compressed", u.Latest.Compressed)
+			s.log.DebugContext(ctx, "catalogstore: wrote file", "path", path, "bytes", len(content), "compressed", fw.Compressed)
 			return nil
 		}
 		if !errors.Is(err, ErrPreconditionFailed) {
