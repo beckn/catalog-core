@@ -632,6 +632,24 @@ func TestIdentity_RetireUnknown(t *testing.T) {
 	}
 }
 
+// TestIdentity_RetireUnknownHugeID: the id of a refused retire is whatever
+// the caller sent; the error must not carry megabytes of it.
+func TestIdentity_RetireUnknownHugeID(t *testing.T) {
+	w := newIDWorld(t)
+	id := "a.example/" + strings.Repeat("x", 1<<20)
+	result := w.call(Submission{CatalogID: id, Directives: PublishDirectives{Retire: true}})
+	if len(result.Errors) != 1 || len(result.Publish.Retirements) != 0 {
+		t.Fatalf("want one error and no tombstone, got %d errors, %d retirements", len(result.Errors), len(result.Publish.Retirements))
+	}
+	if n := len(result.Errors[0].Reason); n > 400 {
+		t.Errorf("reason is %d bytes long", n)
+	}
+	result = w.call(Submission{CatalogID: id, Catalog: tableCatalog(true, "I-1")})
+	if len(result.Errors) != 1 || len(result.Errors[0].Reason) > 400 {
+		t.Errorf("publish under a huge new id: %d errors, reason %d bytes", len(result.Errors), len(result.Errors[0].Reason))
+	}
+}
+
 // TestIdentity_RetireEmptyID: an empty id in a retire is reported, not
 // signed into a tombstone with no catalogId.
 func TestIdentity_RetireEmptyID(t *testing.T) {

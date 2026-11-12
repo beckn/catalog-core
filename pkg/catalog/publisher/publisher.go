@@ -28,6 +28,7 @@ import (
 	"log/slog"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/beckn/catalog-core/pkg/catalog"
 	"github.com/beckn/catalog-core/pkg/catalog/store"
@@ -426,6 +427,21 @@ func admit(sub Submission, prior store.CatalogState, claimed map[string]string) 
 	return "", nil
 }
 
+// shortID cuts an id that is not in the index -- and so can be anything a
+// caller sent, of any length -- down to something that fits in an error
+// message and a log line.
+func shortID(id string) string {
+	const limit = 120
+	if len(id) <= limit {
+		return id
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(id[cut]) {
+		cut--
+	}
+	return id[:cut] + "..."
+}
+
 // sharesFilesWithLiveCatalog reports whether another, still live index
 // entry is written under the same file names as this one.
 func sharesFilesWithLiveCatalog(prior store.CatalogState) (string, bool) {
@@ -449,7 +465,7 @@ func (p Params) retireOne(ctx context.Context, id string, now time.Time, fileNex
 	log := p.logger()
 	prior := p.PriorState[id]
 	if !prior.Known() {
-		reason := fmt.Sprintf("catalog not found: catalogId %q is not in the catalog index, so there is nothing to retire", id)
+		reason := fmt.Sprintf("catalog not found: catalogId %q is not in the catalog index, so there is nothing to retire", shortID(id))
 		if id == "" {
 			reason = "catalog not found: missing catalogId"
 		}
