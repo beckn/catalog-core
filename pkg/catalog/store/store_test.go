@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -303,5 +304,53 @@ func TestPublish_RetiredLatest_WritesFinalTombstone(t *testing.T) {
 	path := store.LatestFilePath("example.test/CAT-1", false)
 	if _, err := blobs.Get(ctx, path); err != nil {
 		t.Errorf("expected latest tombstone at %s: %v", path, err)
+	}
+}
+
+func TestFileNameKey(t *testing.T) {
+	for _, tc := range []struct{ a, b string }{
+		{"a.example/CAT-1", "b.example/CAT-1"},
+		{"a.example/CAT-1", "CAT-1"},
+		{"a.example/CAT-1", "a.example/cat-1"},
+		{"a.example/x/CAT-1", "a.example/y/CAT-1"},
+	} {
+		if store.FileNameKey(tc.a) != store.FileNameKey(tc.b) {
+			t.Errorf("%q and %q are written to the same files but have different keys", tc.a, tc.b)
+		}
+	}
+	if store.FileNameKey("a.example/CAT-1") == store.FileNameKey("a.example/CAT-2") {
+		t.Error("different last segments must have different keys")
+	}
+	// The key is for comparison only: file names keep the id's own case.
+	if got := store.CatalogFilePath("a.example/CAT-1", 1, "json", false); got != "catalogs/CAT-1.v1.json" {
+		t.Errorf("CatalogFilePath = %q; published file names must not change", got)
+	}
+	if got := store.LatestFilePath("a.example/CAT-1", true); got != "catalogs/CAT-1.latest.json.gz" {
+		t.Errorf("LatestFilePath = %q; published file names must not change", got)
+	}
+}
+
+func TestValidateCatalogID(t *testing.T) {
+	ok := []string{
+		"CAT-1", "open-economy.nfh.global/electronics-2026", "a.example/x/y/CAT_1.v2~b",
+		"a.example/" + strings.Repeat("x", store.MaxLocalNameBytes),
+	}
+	for _, id := range ok {
+		if err := store.ValidateCatalogID(id); err != nil {
+			t.Errorf("store.ValidateCatalogID(%q) = %v, want nil", id, err)
+		}
+	}
+	bad := []string{
+		"", " ", "a.example/", "/CAT-1", "a.example//CAT-1", "a.example/../CAT-1", "a.example/./CAT-1", "a.example/..", ".",
+		"a.example/.hidden", "a.example/CAT 1", " CAT-1", "CAT-1 ", "CAT-1\n", "a\texample/CAT-1", "a.example/%41",
+		"a.example/CAT?x", "a.example/CAT#x", `a.example/CAT\x`, "a.example/CAT:1", "a.example/CAT\x00", "a.example/CÄT",
+		"a.example/CAT\xff", "a.example/" + strings.Repeat("x", store.MaxLocalNameBytes+1), strings.Repeat("a/", 600) + "CAT-1",
+	}
+	for _, id := range bad {
+		if err := store.ValidateCatalogID(id); err == nil {
+			t.Errorf("store.ValidateCatalogID(%.40q) = nil, want an error", id)
+		} else if len(err.Error()) > 400 {
+			t.Errorf("error for %.40q is %d bytes long", id, len(err.Error()))
+		}
 	}
 }

@@ -29,6 +29,8 @@ import (
 	"path"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/beckn/catalog-core/pkg/catalog"
 )
@@ -80,11 +82,106 @@ func IndexPath() string { return path.Join(IndexDirName, IndexFilename) }
 // LocalName returns catalogID with any "domain/" prefix stripped, matching
 // the file spec's own example filenames (catalogId
 // "open-economy.nfh.global/electronics-2026" -> "electronics-2026").
+//
+// Every file a catalog owns is named from this, so two catalogIds with the
+// same LocalName would be written to the same files. FileNameKey is the
+// value to compare to find that out, and ValidateCatalogID is the shape a
+// catalogId must have before a first file is written under it.
 func LocalName(catalogID string) string {
 	if i := strings.LastIndex(catalogID, "/"); i != -1 {
 		return catalogID[i+1:]
 	}
 	return catalogID
+}
+
+// FileNameKey identifies the set of file names catalogID's baseline, change
+// and "latest" files are written under. Two catalogIds with the same key
+// share those files: publishing one overwrites the other's. It is LocalName
+// folded to lower case, because a blob store on a case-insensitive
+// filesystem (the default on macOS and Windows) treats "CAT-1.v1.json" and
+// "cat-1.v1.json" as one file.
+//
+// The key is only ever compared. File names and URLs keep using LocalName
+// unchanged, so no published URL moves.
+func FileNameKey(catalogID string) string { return strings.ToLower(LocalName(catalogID)) }
+
+// MaxLocalNameBytes bounds a new catalogId's last path segment. File
+// names are that segment plus a suffix of up to 37 bytes
+// (".v<19 digits>.changes.json.gz"), and most filesystems cap a file name
+// at 255 bytes.
+const MaxLocalNameBytes = 200
+
+// MaxCatalogIDBytes bounds a new catalogId as a whole.
+const MaxCatalogIDBytes = 1024
+
+// ValidateCatalogID reports why catalogID cannot be used for a catalog that
+// has no files yet, or nil if it can. The rules exist because the id's last
+// path segment is used, unescaped, as part of a file name and of a URL:
+//
+//   - not empty, at most MaxCatalogIDBytes, valid UTF-8, no white space or
+//     control characters anywhere;
+//   - no empty, "." or ".." path segment (so no leading, trailing or
+//     doubled "/");
+//   - the last segment uses only A-Z a-z 0-9 "-" "." "_" "~" (the URL
+//     "unreserved" set: it means the same thing in a file name, in a URL
+//     and after percent-decoding), does not start with ".", and is at most
+//     MaxLocalNameBytes long.
+//
+// This is deliberately not applied to a catalogId that already has an
+// index entry: such a catalog keeps its id, file names and URLs whatever
+// they look like, and can still be updated and retired.
+func ValidateCatalogID(catalogID string) error {
+	if catalogID == "" {
+		return errors.New("missing catalogId")
+	}
+	if len(catalogID) > MaxCatalogIDBytes {
+		return fmt.Errorf("catalogId is %d bytes long; the limit is %d", len(catalogID), MaxCatalogIDBytes)
+	}
+	if !utf8.ValidString(catalogID) {
+		return errors.New("catalogId is not valid UTF-8")
+	}
+	for _, r := range catalogID {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return fmt.Errorf("catalogId %q contains white space or a control character", catalogID)
+		}
+	}
+	segments := strings.Split(catalogID, "/")
+	for _, seg := range segments {
+		if seg == "" {
+			return fmt.Errorf("catalogId %q has an empty path segment (a leading, trailing or doubled \"/\")", catalogID)
+		}
+		if seg == "." || seg == ".." {
+			return fmt.Errorf("catalogId %q has a %q path segment", catalogID, seg)
+		}
+	}
+	local := segments[len(segments)-1]
+	if len(local) > MaxLocalNameBytes {
+		return fmt.Errorf("the last path segment of catalogId %q is %d bytes long; the limit is %d (it becomes a file name)", truncateForError(catalogID), len(local), MaxLocalNameBytes)
+	}
+	if strings.HasPrefix(local, ".") {
+		return fmt.Errorf("the last path segment of catalogId %q starts with \".\"; it becomes a file name", catalogID)
+	}
+	for _, r := range local {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '.', r == '_', r == '~':
+		default:
+			return fmt.Errorf("the last path segment of catalogId %q contains %q; it becomes a file name and part of a URL, so only letters, digits, \"-\", \".\", \"_\" and \"~\" are allowed there", catalogID, r)
+		}
+	}
+	return nil
+}
+
+// truncateForError keeps an over-long id from flooding an error message.
+func truncateForError(s string) string {
+	const limit = 80
+	if len(s) <= limit {
+		return s
+	}
+	cut := limit
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "..."
 }
 
 // CatalogFilePath returns the blob key for one catalog file: a baseline
