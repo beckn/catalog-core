@@ -715,3 +715,117 @@ func (s cursorErrStore) GetCatalogCursor(ctx context.Context, id string) (crawlm
 	}
 	return s.fakeStore.GetCatalogCursor(ctx, id)
 }
+
+// --- a crawl overlapping a publish -----------------------------------
+
+// The index already lists the new version but its file is not there yet
+// (404). Transient: rescheduled, and the next attempt succeeds.
+func TestReader_FileNotThereYet_IsRetried(t *testing.T) {
+	r := newReaderRig(t)
+	r.pub.setLive(catA, 1, 1, "a-v1")
+	r.crawl()
+	r.pub.setLive(catA, 2, 2, "a-v2")
+	r.pub.mu.Lock()
+	held := r.pub.files["/files/node-1_CAT-A.v2.json"]
+	delete(r.pub.files, "/files/node-1_CAT-A.v2.json")
+	r.pub.mu.Unlock()
+
+	errs := r.crawl()
+	if len(errs) != 1 || crawler.IsPermanent(errs[0]) {
+		t.Fatalf("want one transient failure, got %v", errs)
+	}
+	r.wantServing(catA, "a-v1")
+
+	r.pub.mu.Lock()
+	r.pub.files["/files/node-1_CAT-A.v2.json"] = held
+	r.pub.mu.Unlock()
+	if errs := r.drain(); len(errs) != 0 {
+		t.Fatalf("retry failed: %v", errs)
+	}
+	r.wantServing(catA, "a-v2")
+}
+
+// The file is replaced under the reader (digest mismatch): parked, old
+// content kept, and picked up by the park sweep once the publisher's index
+// and file agree again -- without the publisher having to publish again.
+func TestReader_FileReplacedUnderReader_RecoversViaSweep(t *testing.T) {
+	r := newReaderRig(t)
+	r.pub.setLive(catA, 1, 1, "a-v1")
+	r.crawl()
+	r.pub.setLive(catA, 2, 2, "a-v2")
+	r.pub.mu.Lock()
+	good := r.pub.files["/files/node-1_CAT-A.v2.json"]
+	r.pub.files["/files/node-1_CAT-A.v2.json"] = []byte(`{"half":"written"}`)
+	r.pub.mu.Unlock()
+
+	errs := r.crawl()
+	if len(errs) != 1 || crawler.PermanentClass(errs[0]) != crawler.FaultDigestMismatch {
+		t.Fatalf("want one digest_mismatch failure, got %v", errs)
+	}
+	r.wantServing(catA, "a-v1")
+
+	r.pub.mu.Lock()
+	r.pub.files["/files/node-1_CAT-A.v2.json"] = good
+	r.pub.mu.Unlock()
+	if err := r.p.RequeueOrAbandonParked(context.Background(), 0); err != nil {
+		t.Fatal(err)
+	}
+	if errs := r.drain(); len(errs) != 0 {
+		t.Fatalf("revived sync failed: %v", errs)
+	}
+	r.wantServing(catA, "a-v2")
+}
+
+// --- slow, hanging and oversized publishers --------------------------
+
+// One publisher that never answers costs one fetch timeout and does not
+// stop the next index from being polled.
+func TestReader_HangingPublisher_IsBoundedAndIsolated(t *testing.T) {
+	r := newReaderRig(t)
+	r.pub.setLive(catA, 1, 1, "a-v1")
+
+	release := make(chan struct{})
+	hang := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { <-release }))
+	defer hang.Close()
+	defer close(release)
+
+	r.p.Fetcher = catalog.NewFetcher(crawler.NewClient(300*time.Millisecond, 1<<20, true), r.keys, 1<<20)
+	r.p.Source = fakeSource{refs: []crawlmanager.IndexRef{
+		{ParticipantID: "slow", IndexURL: hang.URL + "/index"},
+		{ParticipantID: "node-1", IndexURL: r.pub.indexURL()},
+	}}
+	start := time.Now()
+	r.poll()
+	if took := time.Since(start); took > 3*time.Second {
+		t.Errorf("poll took %v with one hanging publisher and a 300ms fetch timeout", took)
+	}
+	r.drain()
+	r.wantServing(catA, "a-v1")
+}
+
+// An index over the fetch cap is refused whole; a large index under it is
+// read. Nothing already synced is touched in either case.
+func TestReader_HugeIndex(t *testing.T) {
+	r := newReaderRig(t)
+	r.pub.setLive(catA, 1, 1, "a-v1")
+	r.crawl()
+
+	fe := r.pub.putFile("/files/shared.v1.json", catA, 1, "x")
+	const n = 3000
+	for i := 0; i < n; i++ {
+		// entries the reader will not sync (out of network scope): this
+		// measures index handling, not n file fetches
+		r.pub.setEntry(catalog.CatalogEntry{CatalogID: fmt.Sprintf("node-1/BULK-%04d", i), EntryVersion: 1, CatalogType: "REGULAR", NetworkIDs: []string{"elsewhere"}, Baseline: fe})
+	}
+	r.pub.setLive(catA, 2, 2, "a-v2")
+
+	r.p.Fetcher = catalog.NewFetcher(crawler.NewClient(30*time.Second, 64<<10, true), r.keys, 64<<10)
+	r.crawl() // over the 64 KiB cap: the poll of this index fails, logged
+	r.wantServing(catA, "a-v1")
+
+	r.p.Fetcher = catalog.NewFetcher(crawler.NewClient(30*time.Second, 8<<20, true), r.keys, 8<<20)
+	start := time.Now()
+	r.crawl()
+	t.Logf("index with %d entries polled and decided in %v", n+1, time.Since(start))
+	r.wantServing(catA, "a-v2")
+}
