@@ -868,34 +868,34 @@ func TestPublish_RetireTwiceThroughStore_LeavesTombstoneUntouched(t *testing.T) 
 	}
 }
 
-// TestPublish_SubmissionForRetiredCatalog_ContinuesEntryVersion: publishing
-// content under a retired catalogId still starts a fresh baseline (there is
-// no content to diff against), but EntryVersion continues from the
-// tombstone's rather than regressing to 1.
-func TestPublish_SubmissionForRetiredCatalog_ContinuesEntryVersion(t *testing.T) {
+// TestPublish_SubmissionForRetiredCatalog_IsRejected: retirement is one-way
+// (NFH-014 CON-TBD-05, CON-TBD-26). A submission under a retired catalogId
+// is a per-catalog error and nothing is signed for it. (This replaces
+// TestPublish_SubmissionForRetiredCatalog_ContinuesEntryVersion, which
+// asserted that such a submission was published as a fresh baseline.)
+func TestPublish_SubmissionForRetiredCatalog_IsRejected(t *testing.T) {
 	priv, keyID := testSigningKey(t)
-	result, err := Publish(context.Background(), Params{
-		Catalogs: []Submission{{CatalogID: "CAT-OLD", Catalog: mustCatalogWithItems("CAT-OLD", "ITEM-1")}},
-		PriorState: map[string]store.CatalogState{
-			"CAT-OLD": {EntryVersion: 6, CatalogType: "REGULAR", Retired: true},
-		},
-		SigningKey: priv, KeyID: keyID, Domain: "example.test",
-	})
-	if err != nil {
-		t.Fatalf("Publish: %v", err)
-	}
-	if len(result.Errors) != 0 || len(result.Publish.Updates) != 1 {
-		t.Fatalf("expected one published update, got Updates=%d Errors=%+v", len(result.Publish.Updates), result.Errors)
-	}
-	var entry catalog.CatalogEntry
-	if err := json.Unmarshal(result.Publish.Updates[0].SignedEntry, &entry); err != nil {
-		t.Fatalf("parsing entry: %v", err)
-	}
-	if entry.EntryVersion != 7 {
-		t.Errorf("EntryVersion = %d, want 7 (continuing from the tombstone's 6)", entry.EntryVersion)
-	}
-	if entry.Baseline.Version != 1 {
-		t.Errorf("Baseline.Version = %d, want a fresh baseline at 1", entry.Baseline.Version)
+	for _, force := range []bool{false, true} {
+		result, err := Publish(context.Background(), Params{
+			Catalogs: []Submission{{
+				CatalogID: "CAT-OLD", Catalog: mustCatalogWithItems("CAT-OLD", "ITEM-1"),
+				Directives: PublishDirectives{ForceBaseline: force},
+			}},
+			PriorState: map[string]store.CatalogState{
+				"CAT-OLD": {EntryVersion: 6, CatalogType: "REGULAR", Retired: true},
+			},
+			SigningKey: priv, KeyID: keyID, Domain: "example.test",
+		})
+		if err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+		if len(result.Publish.Updates) != 0 || len(result.Reports) != 0 {
+			t.Fatalf("forceBaseline=%v: a retired catalogId was published: %+v", force, result.Reports)
+		}
+		if len(result.Errors) != 1 || result.Errors[0].CatalogID != "CAT-OLD" || result.Errors[0].Stage != "validate" ||
+			!strings.Contains(result.Errors[0].Reason, "new catalogId") {
+			t.Fatalf("forceBaseline=%v: expected one validate error telling the caller to use a new catalogId, got %+v", force, result.Errors)
+		}
 	}
 }
 
