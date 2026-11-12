@@ -56,6 +56,11 @@ type BlobStore interface {
 	// versioned filename, or the fixed "latest"/index path), so a
 	// backend needs no versioning or locking of its own beyond an
 	// atomic per-path overwrite.
+	//
+	// That is enough for one writer. Where more than one process can
+	// publish to the same blob store, the backend must also implement
+	// ConditionalBlobStore, or their index writes drop each other's
+	// entries.
 	Put(ctx context.Context, path string, content []byte) error
 }
 
@@ -186,17 +191,27 @@ type PublishRequest struct {
 	NextUpdate  *time.Time
 	Updates     []CatalogUpdate
 	Retirements []CatalogUpdate
+
+	// Base is what LoadForPublish returned alongside the prior state
+	// this request was computed from. When set, Publish returns
+	// ErrConflict instead of committing if another writer has since
+	// changed any catalog in Updates or Retirements. When nil, entries
+	// are merged whatever they replace.
+	Base *Base
 }
 
 // Store is the one canonical assembler over any BlobStore.
 type Store struct {
 	blobs BlobStore
 	log   *slog.Logger
+	retry RetryPolicy
 }
 
 // New constructs a Store over blobs. Plain Go, no onix plugin machinery
 // required. Logs via slog.Default() until WithLogger overrides it.
-func New(blobs BlobStore) *Store { return &Store{blobs: blobs, log: slog.Default()} }
+func New(blobs BlobStore) *Store {
+	return &Store{blobs: blobs, log: slog.Default(), retry: defaultRetryPolicy}
+}
 
 // WithLogger sets the logger this Store uses for every subsequent call,
 // e.g. to route it through an onix-hosted caller's own structured
@@ -251,8 +266,7 @@ func (s *Store) LoadCatalogs(ctx context.Context, catalogIDs []string) (map[stri
 }
 
 // loadCatalogs is LoadCatalogs, also returning the index entries it read
-// (for a caller that must know which
-// entries the returned states were built from).
+// (see LoadForPublish).
 func (s *Store) loadCatalogs(ctx context.Context, catalogIDs []string) (map[string]CatalogState, map[string]json.RawMessage, error) {
 	s.log.DebugContext(ctx, "catalogstore: LoadCatalogs", "requested", len(catalogIDs))
 	entries, _, err := s.readIndexEntries(ctx)
@@ -310,7 +324,12 @@ func (s *Store) readIndexEntries(ctx context.Context) (map[string]json.RawMessag
 		s.log.ErrorContext(ctx, "catalogstore: reading existing index failed", "error", err)
 		return nil, nil, fmt.Errorf("catalogstore: reading existing index: %w", err)
 	}
+	return s.parseIndex(ctx, raw)
+}
 
+// parseIndex splits an index document into its entries keyed by
+// catalogId and the catalogIds in document order.
+func (s *Store) parseIndex(ctx context.Context, raw []byte) (map[string]json.RawMessage, []string, error) {
 	var doc indexDoc
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, nil, fmt.Errorf("catalogstore: parsing existing index: %w", err)
@@ -424,15 +443,33 @@ func (s *Store) reconstructState(ctx context.Context, entry catalog.CatalogEntry
 // --- writes -------------------------------------------------------------
 
 // Publish merges req's catalog updates and retirements into the existing
-// index -- read fresh via readIndexEntries, keyed by catalogId, replacing
-// or appending as needed -- and persists everything: every new file
-// content, then the merged index last (so a failure partway through never
-// leaves the index pointing at a file that was never written).
+// index, keyed by catalogId, replacing or appending as needed, and
+// persists everything.
+//
+// Over a ConditionalBlobStore the index write is a compare-and-swap,
+// retried with the request merged again whenever another writer got in
+// first, so any number of writers can publish at once without losing
+// entries (see publishConditional for the order of writes). It can
+// return ErrConflict (req.Base is stale: recompute and call again) or
+// ErrIndexBusy (retries exhausted: call again).
+//
+// Over a plain BlobStore there is no such protection and the caller
+// must be the only writer: every new file is written, then the merged
+// index last, so a failure partway through never leaves the index
+// pointing at a file that was never written.
 func (s *Store) Publish(ctx context.Context, req PublishRequest) error {
 	s.log.DebugContext(ctx, "catalogstore: Publish", "nodeId", req.NodeID, "updates", len(req.Updates), "retirements", len(req.Retirements))
+	if cas, ok := s.blobs.(ConditionalBlobStore); ok {
+		return s.publishConditional(ctx, cas, req)
+	}
 	entries, order, err := s.readIndexEntries(ctx)
 	if err != nil {
 		return err
+	}
+	// Not atomic with the index write below, but it still catches a
+	// change made between LoadForPublish and here.
+	if ids := req.Base.changed(req, entries); len(ids) > 0 {
+		return &ConflictError{CatalogIDs: ids}
 	}
 
 	apply := func(u CatalogUpdate) error {
