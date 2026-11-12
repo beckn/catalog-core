@@ -294,6 +294,19 @@ func (s *fakeStore) Complete(_ context.Context, id, _ string, cursor crawlmanage
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.claimed, id)
+	// Like the Postgres store: a settle that carries no envelope of its own
+	// (a retire) keeps the one a previous sync captured.
+	if prev, ok := s.cursors[cursor.CatalogID]; ok {
+		if len(cursor.Descriptor) == 0 {
+			cursor.Descriptor = prev.Descriptor
+		}
+		if len(cursor.Provider) == 0 {
+			cursor.Provider = prev.Provider
+		}
+		if cursor.CatalogType == "" {
+			cursor.CatalogType = prev.CatalogType
+		}
+	}
 	s.cursors[cursor.CatalogID] = cursor
 	return nil
 }

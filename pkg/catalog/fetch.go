@@ -102,7 +102,7 @@ func (f *Fetcher) FetchIndex(ctx context.Context, url string, cond IndexConditio
 		// before verifying, unlike verifyFileSignature below.
 		if err := crawler.VerifySignature(ctx, f.keys, raw.NodeID, entry.Signature.KeyID, entry.Signature.Value, entryRaw, "signature"); err != nil {
 			// Unverifiable entry: drop it rather than trust an unsigned/forged one.
-			dropped = append(dropped, DroppedEntry{CatalogID: entry.CatalogID, Reason: err.Error()})
+			dropped = append(dropped, DroppedEntry{CatalogID: entry.CatalogID, Reason: err.Error(), Transient: !crawler.IsPermanent(err)})
 			continue
 		}
 		idx.Catalogs = append(idx.Catalogs, entry)

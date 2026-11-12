@@ -7,6 +7,7 @@ package crawlmanager
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -22,6 +23,16 @@ const DefaultRetryDelay = time.Minute
 // DefaultMaxParkCount is how many RequeueOrAbandonParked sweeps a parked
 // catalog gets before being abandoned, when Params.MaxParkCount is unset.
 const DefaultMaxParkCount = 12
+
+// FaultRollback and FaultRelisted classify an index entry SyncNext refuses
+// to apply: one whose entryVersion or content version is behind the stored
+// cursor (CON-TBD-11), and a live entry for a catalog already retired
+// (CON-TBD-26). Both are publisher-side conditions that retrying the same
+// entry does not fix, so both are permanent.
+const (
+	FaultRollback crawler.FaultClass = "rollback"
+	FaultRelisted crawler.FaultClass = "relisted"
+)
 
 // Params are CrawlManager's injected collaborators.
 type Params struct {
@@ -152,8 +163,17 @@ func (p Params) pollOne(ctx context.Context, ref IndexRef) error {
 	if err != nil {
 		return fmt.Errorf("fetching index %s: %w", ref.IndexURL, err)
 	}
+	// incomplete: this poll did not get to a decision for every entry the
+	// index lists, for a reason that may clear without the index changing.
+	// The validators are then NOT stored, so the next poll reads the index
+	// again instead of taking a 304 and skipping those entries until the
+	// publisher happens to publish something.
+	incomplete := false
 	for _, dropped := range res.Dropped {
-		p.log().WarnContext(ctx, "crawlmanager: dropped unverifiable index entry", "indexUrl", ref.IndexURL, "catalogId", dropped.CatalogID, "reason", dropped.Reason)
+		p.log().WarnContext(ctx, "crawlmanager: dropped unverifiable index entry", "indexUrl", ref.IndexURL, "catalogId", dropped.CatalogID, "reason", dropped.Reason, "transient", dropped.Transient)
+		if dropped.Transient {
+			incomplete = true
+		}
 	}
 	if res.NotModified {
 		p.log().InfoContext(ctx, "crawlmanager: index unchanged since last poll", "indexUrl", ref.IndexURL)
@@ -161,28 +181,66 @@ func (p Params) pollOne(ctx context.Context, ref IndexRef) error {
 	}
 	p.log().InfoContext(ctx, "crawlmanager: fetched index", "indexUrl", ref.IndexURL, "nodeId", res.Index.NodeID, "catalogs", len(res.Index.Catalogs), "dropped", len(res.Dropped))
 
+	// One entry whose decision fails (a store error) does not stop the rest
+	// of this index from being examined, any more than one index failing
+	// stops the other indexes.
+	var failed []error
 	for _, entry := range res.Index.Catalogs {
 		if err := p.decideCatalog(ctx, ref, entry); err != nil {
-			return fmt.Errorf("deciding %s: %w", entry.CatalogID, err)
+			failed = append(failed, fmt.Errorf("deciding %s: %w", entry.CatalogID, err))
 		}
 	}
-	return p.Store.UpsertIndexCursor(ctx, IndexCursor{IndexURL: ref.IndexURL, ParticipantID: ref.ParticipantID, ETag: res.ETag, LastModified: res.LastModified})
+	cursor := IndexCursor{IndexURL: ref.IndexURL, ParticipantID: ref.ParticipantID, ETag: res.ETag, LastModified: res.LastModified}
+	if incomplete || len(failed) > 0 {
+		cursor.ETag, cursor.LastModified = "", ""
+	}
+	if err := p.Store.UpsertIndexCursor(ctx, cursor); err != nil {
+		failed = append(failed, err)
+	}
+	return errors.Join(failed...)
 }
 
-// decideCatalog runs catalog.DetectChange against entry's stored cursor and
-// acts on the result: ActionSync enqueues only if entry is in this
-// deployment's network scope (catalog.ResolveScope); ActionRetire enqueues
-// unconditionally (regardless of scope) but only if this catalog was ever
-// seen -- nothing to retire otherwise; ActionRollback is logged as an
-// operator-visible warning and NOT enqueued (CON-TBD-11: a regression is a
-// publisher-side data problem, not something to silently apply);
-// ActionSkipUnchanged does nothing.
+// cursorState adapts a stored cursor to catalog.Decide's input.
+func cursorState(c CatalogCursor, seen bool) catalog.CursorState {
+	return catalog.CursorState{Seen: seen, Retired: seen && c.Retired, EntryVersion: c.EntryVersion, ContentVersion: c.Version}
+}
+
+// flag makes a refused entry visible beyond the log: it is recorded as the
+// catalog's latest failure reason, which a Store surfaces to an operator
+// (CON-TBD-11: a regression MUST be flagged). The cursor is not touched.
+func (p Params) flag(ctx context.Context, ref IndexRef, catalogID, reason string) {
+	report := PassReport{CatalogID: catalogID, IndexURL: ref.IndexURL, ParticipantID: ref.ParticipantID, Error: reason, At: p.now()}
+	if err := p.Store.RecordFailure(ctx, report); err != nil {
+		p.log().ErrorContext(ctx, "crawlmanager: recording refused entry failed", "catalogId", catalogID, "error", err)
+	}
+}
+
+func rollbackReason(entry catalog.CatalogEntry, cursor CatalogCursor) string {
+	return fmt.Sprintf("crawlmanager: possible rollback, not applied: index declares entryVersion=%d version=%d, already synced entryVersion=%d version=%d",
+		entry.EntryVersion, entry.LatestVersion(), cursor.EntryVersion, cursor.Version)
+}
+
+func relistedReason(entry catalog.CatalogEntry) string {
+	return fmt.Sprintf("crawlmanager: catalog is listed again (entryVersion=%d) after it was retired, not applied: a retired catalogId cannot be reused",
+		entry.EntryVersion)
+}
+
+// decideCatalog runs catalog.Decide against entry's stored cursor and acts
+// on the result: ActionSync enqueues only if entry is in this deployment's
+// network scope (catalog.ResolveScope); ActionRetire enqueues
+// unconditionally (regardless of scope, and regardless of the tombstone's
+// own entryVersion -- see catalog.Decide) but only if this catalog was ever
+// seen -- nothing to retire otherwise; ActionRollback and ActionRelisted are
+// flagged for an operator and NOT enqueued (CON-TBD-11: a regression is a
+// publisher-side data problem, not something to silently apply; CON-TBD-26:
+// a retired catalogId is not offered again); ActionSkipUnchanged does
+// nothing.
 func (p Params) decideCatalog(ctx context.Context, ref IndexRef, entry catalog.CatalogEntry) error {
 	cursor, seen, err := p.Store.GetCatalogCursor(ctx, entry.CatalogID)
 	if err != nil {
 		return fmt.Errorf("loading cursor: %w", err)
 	}
-	d := catalog.DetectChange(entry, cursor.EntryVersion, cursor.Version, seen)
+	d := catalog.Decide(entry, cursorState(cursor, seen))
 	switch d.Action {
 	case catalog.ActionSync:
 		if take, _ := catalog.ResolveScope(entry, p.Networks); !take {
@@ -206,6 +264,10 @@ func (p Params) decideCatalog(ctx context.Context, ref IndexRef, entry catalog.C
 	case catalog.ActionRollback:
 		p.log().WarnContext(ctx, "crawlmanager: rollback detected, not applying", "catalogId", entry.CatalogID,
 			"storedVersion", cursor.Version, "declaredVersion", d.ToVersion, "storedEntryVersion", cursor.EntryVersion, "declaredEntryVersion", entry.EntryVersion)
+		p.flag(ctx, ref, entry.CatalogID, rollbackReason(entry, cursor))
+	case catalog.ActionRelisted:
+		p.log().WarnContext(ctx, "crawlmanager: catalog listed again after retirement, not applying", "catalogId", entry.CatalogID, "declaredEntryVersion", entry.EntryVersion)
+		p.flag(ctx, ref, entry.CatalogID, relistedReason(entry))
 	case catalog.ActionSkipUnchanged:
 		p.log().DebugContext(ctx, "crawlmanager: catalog unchanged", "catalogId", entry.CatalogID, "entryVersion", cursor.EntryVersion)
 	}
@@ -314,6 +376,26 @@ func (p Params) syncActive(ctx context.Context, item *ClaimedItem) error {
 		return crawler.Permanentf("crawlmanager: %s no longer listed in index %s", item.CatalogID, item.IndexURL)
 	}
 
+	// The decision that queued this item was made against an earlier read
+	// of the index, possibly long ago (a parked item revived by the sweep).
+	// Decide again on the entry as it is NOW, so the checks PollIndexes
+	// applies cannot be bypassed by timing: a sync never applies a
+	// regressed or re-listed entry, and an entry retired in the meantime is
+	// retired here instead of failing on a tombstone's missing files.
+	cursor, seen, err := p.Store.GetCatalogCursor(ctx, item.CatalogID)
+	if err != nil {
+		return fmt.Errorf("crawlmanager: loading cursor for %s: %w", item.CatalogID, err)
+	}
+	if entry.IsRetired() {
+		return p.retireOne(ctx, item)
+	}
+	switch catalog.Decide(entry, cursorState(cursor, seen)).Action {
+	case catalog.ActionRollback:
+		return crawler.PermanentFaultf(FaultRollback, "%s", rollbackReason(entry, cursor))
+	case catalog.ActionRelisted:
+		return crawler.PermanentFaultf(FaultRelisted, "%s", relistedReason(entry))
+	}
+
 	baselineContent, err := p.Fetcher.FetchFile(ctx, res.Index.NodeID, entry.CatalogID, entry.Baseline)
 	if err != nil {
 		return err
@@ -343,16 +425,16 @@ func (p Params) syncActive(ctx context.Context, item *ClaimedItem) error {
 	// atomically (Store's job to make that one transaction) -- a separate
 	// UpsertCatalogCursor call here would let a crash between the two leave
 	// the cursor advanced but the item still claimed, or vice versa.
-	cursor := CatalogCursor{
+	settled := CatalogCursor{
 		CatalogID: entry.CatalogID, IndexURL: item.IndexURL, ParticipantID: item.ParticipantID,
 		Version: entry.LatestVersion(), EntryVersion: entry.EntryVersion,
 		Descriptor: descriptor, Provider: provider, CatalogType: entry.CatalogType,
 		SyncedAt: p.now(),
 	}
-	if err := p.Store.Complete(ctx, item.ID, item.ClaimID, cursor); err != nil {
+	if err := p.Store.Complete(ctx, item.ID, item.ClaimID, settled); err != nil {
 		return err
 	}
-	p.log().InfoContext(ctx, "crawlmanager: catalog synced and pushed", "catalogId", entry.CatalogID, "version", cursor.Version, "entryVersion", cursor.EntryVersion, "contentBytes", len(content))
+	p.log().InfoContext(ctx, "crawlmanager: catalog synced and pushed", "catalogId", entry.CatalogID, "version", settled.Version, "entryVersion", settled.EntryVersion, "contentBytes", len(content))
 	return nil
 }
 
@@ -392,9 +474,29 @@ func (p Params) stampIdentity(ctx context.Context, nodeID string, entry catalog.
 }
 
 func (p Params) retireOne(ctx context.Context, item *ClaimedItem) error {
+	// The settled cursor keeps the version lineage and index URL it had: a
+	// retired catalog's cursor is still what a later re-listing is judged
+	// against, and is still what an operator reads.
+	prior, seen, err := p.Store.GetCatalogCursor(ctx, item.CatalogID)
+	if err != nil {
+		return fmt.Errorf("crawlmanager: loading cursor for %s: %w", item.CatalogID, err)
+	}
+	retired := CatalogCursor{
+		CatalogID: item.CatalogID, IndexURL: item.IndexURL, ParticipantID: item.ParticipantID,
+		Version: prior.Version, EntryVersion: prior.EntryVersion, Retired: true, SyncedAt: p.now(),
+	}
+	if seen && prior.Retired {
+		// Already wiped and settled (a second retire item for the same
+		// catalog): settle the claim without pushing another wipe.
+		return p.Store.Complete(ctx, item.ID, item.ClaimID, retired)
+	}
+
 	descriptor, provider, catalogType, participantID, ok, err := p.Store.GetCatalogEnvelope(ctx, item.CatalogID)
 	if err != nil {
 		return fmt.Errorf("crawlmanager: loading envelope for %s: %w", item.CatalogID, err)
+	}
+	if participantID != "" {
+		retired.ParticipantID = participantID
 	}
 	if !ok {
 		// No envelope was ever captured -- decideCatalog's !seen guard already
@@ -403,7 +505,7 @@ func (p Params) retireOne(ctx context.Context, item *ClaimedItem) error {
 		// about what Sink holds for this catalog, so there is nothing safe to
 		// wipe. Settle as retired anyway rather than parking forever on a
 		// catalog that was never actually delivered.
-		if err := p.Store.Complete(ctx, item.ID, item.ClaimID, CatalogCursor{CatalogID: item.CatalogID, Retired: true, SyncedAt: p.now()}); err != nil {
+		if err := p.Store.Complete(ctx, item.ID, item.ClaimID, retired); err != nil {
 			return err
 		}
 		p.log().InfoContext(ctx, "crawlmanager: catalog retired (nothing to wipe, no envelope was ever captured)", "catalogId", item.CatalogID)
@@ -421,7 +523,7 @@ func (p Params) retireOne(ctx context.Context, item *ClaimedItem) error {
 	if !outcome.Accepted {
 		return fmt.Errorf("crawlmanager: sink rejected retiring %s: %s", item.CatalogID, outcome.Reason)
 	}
-	if err := p.Store.Complete(ctx, item.ID, item.ClaimID, CatalogCursor{CatalogID: item.CatalogID, ParticipantID: participantID, Retired: true, SyncedAt: p.now()}); err != nil {
+	if err := p.Store.Complete(ctx, item.ID, item.ClaimID, retired); err != nil {
 		return err
 	}
 	p.log().InfoContext(ctx, "crawlmanager: catalog retired and wiped", "catalogId", item.CatalogID)
