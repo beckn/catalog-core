@@ -45,8 +45,8 @@ func newIDWorld(t *testing.T) *idWorld {
 }
 
 // call runs one publish call end to end and persists whatever it produced,
-// exactly as the onix plugin does (it persists even when every submission
-// was rejected).
+// exactly as the onix plugin does (it hands the result to the store even
+// when every submission was rejected; the store then writes nothing).
 func (w *idWorld) call(subs ...Submission) Result {
 	w.t.Helper()
 	ctx := context.Background()

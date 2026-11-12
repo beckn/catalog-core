@@ -381,9 +381,11 @@ type FileWrite struct {
 // by the caller; Store never signs anything, it holds no key material --
 // plus whichever new file content that entry references. Used for both
 // an ordinary update (Baseline and/or Change, optionally Latest) and a
-// retirement (SignedEntry is a tombstone; Latest set only when this
-// catalog previously had one, for its one-time final tombstone write;
-// Baseline/Change nil).
+// retirement (SignedEntry is a tombstone; Latest, and LatestAlt for a
+// second file name, carry the final copy with retiredAt for each
+// "latest" file the catalog has; Baseline/Change nil). A repeated retire
+// that has to repair a "latest" file sends the tombstone already in the
+// index again, with that file.
 type CatalogUpdate struct {
 	CatalogID   string
 	SignedEntry json.RawMessage
