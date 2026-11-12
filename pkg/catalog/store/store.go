@@ -246,10 +246,18 @@ type fileEnvelope struct {
 // Presence in the result therefore does not by itself mean there is
 // content to diff against; check Retired, or Catalog, for that.
 func (s *Store) LoadCatalogs(ctx context.Context, catalogIDs []string) (map[string]CatalogState, error) {
+	result, _, err := s.loadCatalogs(ctx, catalogIDs)
+	return result, err
+}
+
+// loadCatalogs is LoadCatalogs, also returning the index entries it read
+// (for a caller that must know which
+// entries the returned states were built from).
+func (s *Store) loadCatalogs(ctx context.Context, catalogIDs []string) (map[string]CatalogState, map[string]json.RawMessage, error) {
 	s.log.DebugContext(ctx, "catalogstore: LoadCatalogs", "requested", len(catalogIDs))
 	entries, _, err := s.readIndexEntries(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	result := make(map[string]CatalogState, len(catalogIDs))
@@ -261,7 +269,7 @@ func (s *Store) LoadCatalogs(ctx context.Context, catalogIDs []string) (map[stri
 		}
 		var entry catalog.CatalogEntry
 		if err := json.Unmarshal(rawEntry, &entry); err != nil {
-			return nil, fmt.Errorf("catalogstore: parsing entry for %s: %w", id, err)
+			return nil, nil, fmt.Errorf("catalogstore: parsing entry for %s: %w", id, err)
 		}
 		if entry.IsRetired() {
 			s.log.DebugContext(ctx, "catalogstore: catalog already retired, returning tombstone state", "catalogId", id, "entryVersion", entry.EntryVersion)
@@ -280,12 +288,12 @@ func (s *Store) LoadCatalogs(ctx context.Context, catalogIDs []string) (map[stri
 		}
 		state, err := s.reconstructState(ctx, entry)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		result[id] = *state
 	}
 	s.log.DebugContext(ctx, "catalogstore: LoadCatalogs done", "requested", len(catalogIDs), "reconstructed", len(result))
-	return result, nil
+	return result, entries, nil
 }
 
 // readIndexEntries reads the current index (if any), returning every
