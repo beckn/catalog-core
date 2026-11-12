@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/beckn/catalog-core/pkg/catalog"
 	"github.com/beckn/catalog-core/pkg/catalog/store"
@@ -232,5 +233,46 @@ func TestLatest_ResumesAtTheExistingNameWhenSwitchedBackOn(t *testing.T) {
 	json.Unmarshal(w.indexEntryRaw(), &entry)
 	if entry.Latest == nil || strings.HasSuffix(entry.Latest.URL, ".gz") {
 		t.Errorf("latest = %+v, want it back at the original plain name", entry.Latest)
+	}
+}
+
+// Things other than content that must make an "unchanged" republish
+// rewrite latest, and so change the entry and bump entryVersion: the
+// signing key was rotated, the public base URL moved.
+func TestLatest_UnchangedRepublishRewritesAfterKeyOrBaseURLChange(t *testing.T) {
+	for _, what := range []string{"key rotated", "base url moved"} {
+		t.Run(what, func(t *testing.T) {
+			w := newLifecycleWorld(t, true, true)
+			w.call(w.submission())
+			prior, err := w.store.LoadCatalogs(w.ctx, []string{lifecycleID})
+			if err != nil {
+				t.Fatalf("LoadCatalogs: %v", err)
+			}
+			p := Params{
+				Catalogs: []Submission{w.submission()}, PriorState: prior,
+				Gzip: true, PublishLatest: true, NextUpdateIn: time.Hour,
+				SigningKey: w.priv, KeyID: w.keyID, Domain: "example.test", PublicBaseURL: w.srv.URL,
+			}
+			if what == "key rotated" {
+				p.KeyID = "test-key-2"
+			} else {
+				p.PublicBaseURL = "https://cdn.example.test"
+			}
+			res, err := Publish(w.ctx, p)
+			if err != nil || len(res.Errors) != 0 {
+				t.Fatalf("Publish: err=%v errors=%+v", err, res.Errors)
+			}
+			if res.Publish.Updates[0].Latest == nil {
+				t.Fatalf("latest was not rewritten")
+			}
+			if r := res.Reports[0]; r.Mode != "metadata" || r.EntryVersion != 2 {
+				t.Errorf("report = mode %q entryVersion %d, want metadata/2", r.Mode, r.EntryVersion)
+			}
+			var doc catalog.CatalogFileDoc
+			json.Unmarshal(res.Publish.Updates[0].Latest.Content, &doc)
+			if doc.Signature.KeyID != p.KeyID {
+				t.Errorf("latest signed with %q, want %q", doc.Signature.KeyID, p.KeyID)
+			}
+		})
 	}
 }

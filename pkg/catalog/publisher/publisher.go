@@ -809,8 +809,10 @@ func (p Params) latestCompressed(prior store.CatalogState) bool {
 // intactLatest returns the prior entry's "latest" reference when this call
 // publishes no new content and the file it points at is still exactly what
 // that reference says: same name and URL as this call would use, current
-// version, and stored bytes whose digest matches. Otherwise nil, and the
-// file is rewritten.
+// version, stored bytes whose digest matches, and signed with the key this
+// call signs with (after a key rotation the one file that can be re-signed
+// in place is, so it does not depend on the old key staying registered).
+// Otherwise nil, and the file is rewritten.
 func (p Params) intactLatest(catalogID string, prior store.CatalogState, oc outcome, compressed bool) *catalog.FileEntry {
 	if oc.Content != nil || prior.LatestFile == nil {
 		return nil
@@ -822,6 +824,10 @@ func (p Params) intactLatest(catalogID string, prior store.CatalogState, oc outc
 	}
 	want, _, err := p.buildLatestFileEntry(catalogID, oc.Version, st.Content, compressed)
 	if err != nil || want.URL != ref.URL || want.Digest != ref.Digest || st.ServedSize != ref.Size {
+		return nil
+	}
+	var doc catalog.CatalogFileDoc
+	if json.Unmarshal(st.Content, &doc) != nil || doc.Signature.KeyID != p.KeyID {
 		return nil
 	}
 	return &ref
