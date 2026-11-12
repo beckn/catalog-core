@@ -666,6 +666,11 @@ func (s *Store) Publish(ctx context.Context, req PublishRequest) error {
 	if err != nil {
 		return err
 	}
+	// Before anything is written: see checkNewCatalogIDs.
+	if err := checkNewCatalogIDs(entries, order, req); err != nil {
+		s.log.ErrorContext(ctx, "catalogstore: publish refused", "error", err)
+		return err
+	}
 
 	apply := func(u CatalogUpdate) error {
 		if err := s.writeCatalogFiles(ctx, u); err != nil {
@@ -703,6 +708,49 @@ func (s *Store) Publish(ctx context.Context, req PublishRequest) error {
 		return fmt.Errorf("catalogstore: writing index: %w", err)
 	}
 	s.log.DebugContext(ctx, "catalogstore: Publish done", "entries", len(ordered), "bytes", len(indexBytes))
+	return nil
+}
+
+// ErrCatalogIDNotAllowed is wrapped by the error Publish returns when a
+// request would add a catalogId to the index that must not be added (see
+// checkNewCatalogIDs).
+var ErrCatalogIDNotAllowed = errors.New("catalogstore: catalogId not allowed")
+
+// checkNewCatalogIDs is the store's own last check on the catalogIds a
+// request would add to the index, made before any file is written. A
+// caller that goes through LoadCatalogs and pkg/catalog/publisher never
+// gets here with such a request -- the publisher has already reported it
+// as a per-catalog error -- so a refusal here fails the whole request: it
+// means the caller skipped that step, or the index changed in between.
+//
+// For an update whose catalogId has no index entry yet: the id must pass
+// ValidateCatalogID, and its file names (FileNameKey) must not belong to
+// another entry in the index or to another new id in the same request.
+// Without this, the write below would silently replace another catalog's
+// baseline and "latest" files (CON-TBD-23).
+//
+// An id that is already in the index is not re-checked here, and neither
+// is a retirement: a tombstone writes no baseline or change file, and
+// whether an id may be retired is the publisher's decision.
+func checkNewCatalogIDs(entries map[string]json.RawMessage, order []string, req PublishRequest) error {
+	owners := nameOwners(entries, order)
+	claimed := make(map[string]string, len(req.Updates))
+	for _, u := range req.Updates {
+		if _, exists := entries[u.CatalogID]; exists {
+			continue
+		}
+		if err := ValidateCatalogID(u.CatalogID); err != nil {
+			return fmt.Errorf("%w: %w", ErrCatalogIDNotAllowed, err)
+		}
+		if conflicts := conflictsFor(owners, u.CatalogID); len(conflicts) > 0 {
+			return fmt.Errorf("%w: %q would be stored under the same file names as %q, which is already in the catalog index", ErrCatalogIDNotAllowed, u.CatalogID, conflicts[0].CatalogID)
+		}
+		key := FileNameKey(u.CatalogID)
+		if other, taken := claimed[key]; taken && other != u.CatalogID {
+			return fmt.Errorf("%w: %q and %q, both new in this request, would be stored under the same file names", ErrCatalogIDNotAllowed, other, u.CatalogID)
+		}
+		claimed[key] = u.CatalogID
+	}
 	return nil
 }
 

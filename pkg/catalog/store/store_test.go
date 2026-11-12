@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -391,5 +392,50 @@ func TestLoadCatalogs_ReportsNameConflicts(t *testing.T) {
 	}
 	if _, present := states["b.example/CAT-3"]; present {
 		t.Error("b.example/CAT-3 has no entry and no conflict; it must be absent from the result")
+	}
+}
+
+// TestPublish_RefusesNewIdThatWouldShareFiles: the store itself refuses,
+// before writing anything, a request that would put a new catalogId's
+// files on top of another catalog's -- whatever the caller checked.
+func TestPublish_RefusesNewIdThatWouldShareFiles(t *testing.T) {
+	blobs := newFakeBlobStore()
+	s := store.New(blobs)
+	if err := publishBaseline(t, s, "a.example/CAT-1"); err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	before := map[string]string{}
+	for p, b := range blobs.data {
+		before[p] = string(b)
+	}
+
+	for _, id := range []string{"b.example/CAT-1", "a.example/cat-1", "a.example/CAT 2", "a.example/"} {
+		err := publishBaseline(t, s, id)
+		if !errors.Is(err, store.ErrCatalogIDNotAllowed) {
+			t.Errorf("Publish(%q) = %v, want ErrCatalogIDNotAllowed", id, err)
+		}
+	}
+	// Two new ids in one request.
+	content := baselineFile(t, "x", json.RawMessage(`{"id":"x","descriptor":{"name":"x"}}`), time.Now().Add(time.Hour))
+	err := s.Publish(context.Background(), store.PublishRequest{NodeID: "example.test", Updates: []store.CatalogUpdate{
+		{CatalogID: "a.example/NEW", SignedEntry: json.RawMessage(`{"catalogId":"a.example/NEW"}`), Baseline: &store.FileWrite{Version: 1, Content: content}},
+		{CatalogID: "b.example/NEW", SignedEntry: json.RawMessage(`{"catalogId":"b.example/NEW"}`), Baseline: &store.FileWrite{Version: 1, Content: content}},
+	}})
+	if !errors.Is(err, store.ErrCatalogIDNotAllowed) {
+		t.Errorf("two new ids sharing file names: Publish = %v, want ErrCatalogIDNotAllowed", err)
+	}
+
+	if len(blobs.data) != len(before) {
+		t.Errorf("a refused publish wrote files: %d blobs, had %d", len(blobs.data), len(before))
+	}
+	for p, b := range before {
+		if string(blobs.data[p]) != b {
+			t.Errorf("%s changed", p)
+		}
+	}
+
+	// An id already in the index is not re-checked: it can be updated.
+	if err := publishBaseline(t, s, "a.example/CAT-1"); err != nil {
+		t.Errorf("update of an existing id: %v", err)
 	}
 }
