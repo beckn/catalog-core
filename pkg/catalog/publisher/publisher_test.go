@@ -754,6 +754,151 @@ func TestPublish_RetireWithPriorState_KeepsMetadataAndBumpsEntryVersion(t *testi
 	}
 }
 
+// TestPublish_RetireAlreadyRetired_IsNoOp: retiring a catalog whose index
+// entry is already a tombstone must not sign another one -- that would
+// move retiredAt and, before store.CatalogState carried Retired, reset
+// EntryVersion to 1 (a regression a DS must treat as a possible rollback,
+// NFH-014 CON-TBD-03/CON-TBD-11).
+func TestPublish_RetireAlreadyRetired_IsNoOp(t *testing.T) {
+	priv, keyID := testSigningKey(t)
+	result, err := Publish(context.Background(), Params{
+		Catalogs: []Submission{{CatalogID: "CAT-OLD", Directives: PublishDirectives{Retire: true}}},
+		PriorState: map[string]store.CatalogState{
+			"CAT-OLD": {EntryVersion: 6, CatalogType: "REGULAR", Retired: true},
+		},
+		SigningKey: priv, KeyID: keyID, Domain: "example.test",
+	})
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if len(result.Publish.Retirements) != 0 || len(result.Publish.Updates) != 0 {
+		t.Errorf("expected nothing to be written for an already-retired catalog, got Retirements=%d Updates=%d",
+			len(result.Publish.Retirements), len(result.Publish.Updates))
+	}
+	if len(result.Errors) != 0 {
+		t.Errorf("a repeat retire is not an error, got %+v", result.Errors)
+	}
+}
+
+// memBlobs is a minimal in-memory store.BlobStore for round trips through
+// the real Store.
+type memBlobs map[string][]byte
+
+func (m memBlobs) Get(_ context.Context, path string) ([]byte, error) {
+	b, ok := m[path]
+	if !ok {
+		return nil, store.ErrBlobNotFound
+	}
+	return b, nil
+}
+
+func (m memBlobs) Put(_ context.Context, path string, content []byte) error {
+	m[path] = append([]byte{}, content...)
+	return nil
+}
+
+// TestPublish_RetireTwiceThroughStore_LeavesTombstoneUntouched drives the
+// whole path the way a caller does -- publish, persist, load, retire,
+// persist, load, retire again -- and checks the index entry is byte-for-
+// byte the same after the second retire.
+func TestPublish_RetireTwiceThroughStore_LeavesTombstoneUntouched(t *testing.T) {
+	ctx := context.Background()
+	priv, keyID := testSigningKey(t)
+	blobs := memBlobs{}
+	s := store.New(blobs)
+	const id = "example.test/CAT-1"
+
+	run := func(sub Submission) Result {
+		t.Helper()
+		prior, err := s.LoadCatalogs(ctx, []string{id})
+		if err != nil {
+			t.Fatalf("LoadCatalogs: %v", err)
+		}
+		result, err := Publish(ctx, Params{
+			Catalogs: []Submission{sub}, PriorState: prior, PublishLatest: true,
+			SigningKey: priv, KeyID: keyID, Domain: "example.test", PublicBaseURL: "https://example.test",
+		})
+		if err != nil || len(result.Errors) != 0 {
+			t.Fatalf("Publish: err=%v errors=%+v", err, result.Errors)
+		}
+		if err := s.Publish(ctx, result.Publish); err != nil {
+			t.Fatalf("store.Publish: %v", err)
+		}
+		return result
+	}
+	entry := func() catalog.CatalogEntry {
+		t.Helper()
+		var idx struct {
+			Catalogs []catalog.CatalogEntry `json:"catalogs"`
+		}
+		raw, err := blobs.Get(ctx, store.IndexPath())
+		if err != nil {
+			t.Fatalf("reading index: %v", err)
+		}
+		if err := json.Unmarshal(raw, &idx); err != nil {
+			t.Fatalf("parsing index: %v", err)
+		}
+		for _, e := range idx.Catalogs {
+			if e.CatalogID == id {
+				return e
+			}
+		}
+		t.Fatalf("%s not in index", id)
+		return catalog.CatalogEntry{}
+	}
+
+	run(Submission{CatalogID: id, Catalog: mustCatalogWithItems("CAT-1", "ITEM-1"), NetworkIds: []string{"net.example"}})
+	run(Submission{CatalogID: id, Catalog: mustCatalogWithItems("CAT-1", "ITEM-1", "ITEM-2"), NetworkIds: []string{"net.example"}})
+	first := run(Submission{CatalogID: id, Directives: PublishDirectives{Retire: true}})
+	if len(first.Publish.Retirements) != 1 || first.Publish.Retirements[0].Latest == nil {
+		t.Fatalf("first retire: expected a tombstone with a final latest write, got %+v", first.Publish.Retirements)
+	}
+	after1 := entry()
+	if !after1.IsRetired() || after1.EntryVersion != 3 || len(after1.NetworkIDs) != 1 {
+		t.Fatalf("after first retire: %+v, want a tombstone at entryVersion 3 keeping its networkIds", after1)
+	}
+
+	second := run(Submission{CatalogID: id, Directives: PublishDirectives{Retire: true}})
+	if len(second.Publish.Retirements) != 0 {
+		t.Fatalf("second retire signed another tombstone: %+v", second.Publish.Retirements)
+	}
+	after2 := entry()
+	if after2.EntryVersion != after1.EntryVersion || after2.RetiredAt != after1.RetiredAt || after2.Signature != after1.Signature || len(after2.NetworkIDs) != 1 {
+		t.Errorf("tombstone changed on the second retire:\n before %+v\n after  %+v", after1, after2)
+	}
+}
+
+// TestPublish_SubmissionForRetiredCatalog_ContinuesEntryVersion: publishing
+// content under a retired catalogId still starts a fresh baseline (there is
+// no content to diff against), but EntryVersion continues from the
+// tombstone's rather than regressing to 1.
+func TestPublish_SubmissionForRetiredCatalog_ContinuesEntryVersion(t *testing.T) {
+	priv, keyID := testSigningKey(t)
+	result, err := Publish(context.Background(), Params{
+		Catalogs: []Submission{{CatalogID: "CAT-OLD", Catalog: mustCatalogWithItems("CAT-OLD", "ITEM-1")}},
+		PriorState: map[string]store.CatalogState{
+			"CAT-OLD": {EntryVersion: 6, CatalogType: "REGULAR", Retired: true},
+		},
+		SigningKey: priv, KeyID: keyID, Domain: "example.test",
+	})
+	if err != nil {
+		t.Fatalf("Publish: %v", err)
+	}
+	if len(result.Errors) != 0 || len(result.Publish.Updates) != 1 {
+		t.Fatalf("expected one published update, got Updates=%d Errors=%+v", len(result.Publish.Updates), result.Errors)
+	}
+	var entry catalog.CatalogEntry
+	if err := json.Unmarshal(result.Publish.Updates[0].SignedEntry, &entry); err != nil {
+		t.Fatalf("parsing entry: %v", err)
+	}
+	if entry.EntryVersion != 7 {
+		t.Errorf("EntryVersion = %d, want 7 (continuing from the tombstone's 6)", entry.EntryVersion)
+	}
+	if entry.Baseline.Version != 1 {
+		t.Errorf("Baseline.Version = %d, want a fresh baseline at 1", entry.Baseline.Version)
+	}
+}
+
 // TestPublish_RetireWithLatestPublished_WritesFinalTombstone proves
 // CON-TBD-38: retiring a catalog whose PriorState.LatestPublished is set
 // must produce a final, self-signed CatalogFileDoc carrying retiredAt --

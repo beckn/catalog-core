@@ -365,6 +365,14 @@ func Publish(ctx context.Context, p Params) (Result, error) {
 func (p Params) retireOne(ctx context.Context, id string, now time.Time, fileNextUpdate time.Time, result *Result) error {
 	log := p.logger()
 	prior := p.PriorState[id]
+	// Retirement is one-way and happens once (NFH-014 CON-TBD-05): the
+	// tombstone already in the index is authoritative. Signing a second
+	// one would move retiredAt, so it no longer matches the final
+	// "latest" file, for no change in what a consumer should conclude.
+	if prior.Retired {
+		log.DebugContext(ctx, "catalog/publisher: catalog already retired, nothing to do", "catalogId", id, "entryVersion", prior.EntryVersion)
+		return nil
+	}
 	raw, err := p.signEntry(catalog.CatalogEntry{
 		CatalogID:    id,
 		EntryVersion: prior.EntryVersion + 1,

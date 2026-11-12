@@ -138,6 +138,16 @@ type CatalogState struct {
 	// caller currently has that turned on, since retiring a catalog that
 	// had one still needs a final write to that same stable URL.
 	LatestPublished bool
+
+	// Retired reports that this catalog's index entry is already a
+	// tombstone (retiredAt set). Such a state carries only what the
+	// tombstone itself does -- EntryVersion, CatalogType, NetworkIds,
+	// SchemaTypes -- and never Catalog/BaselineFile/ChangeFiles: there is
+	// no content left to diff against. It exists so a caller can tell an
+	// already-retired catalog from one that never existed, and so
+	// EntryVersion keeps its lineage (NFH-014 CON-TBD-03) instead of
+	// restarting from zero.
+	Retired bool
 }
 
 // FileWrite is one file's content to persist. Version drives the
@@ -230,6 +240,11 @@ type fileEnvelope struct {
 // file applied -- for each of catalogIDs that has prior publish history.
 // A requested catalogId absent from the result has none: the caller
 // starts a fresh baseline for it.
+//
+// A retired catalogId is present in the result with CatalogState.Retired
+// set and no content (Catalog, BaselineFile and ChangeFiles are empty).
+// Presence in the result therefore does not by itself mean there is
+// content to diff against; check Retired, or Catalog, for that.
 func (s *Store) LoadCatalogs(ctx context.Context, catalogIDs []string) (map[string]CatalogState, error) {
 	s.log.DebugContext(ctx, "catalogstore: LoadCatalogs", "requested", len(catalogIDs))
 	entries, _, err := s.readIndexEntries(ctx)
@@ -248,8 +263,19 @@ func (s *Store) LoadCatalogs(ctx context.Context, catalogIDs []string) (map[stri
 		if err := json.Unmarshal(rawEntry, &entry); err != nil {
 			return nil, fmt.Errorf("catalogstore: parsing entry for %s: %w", id, err)
 		}
-		if entry.IsRetired() || entry.Baseline.URL == "" {
-			s.log.DebugContext(ctx, "catalogstore: no publishable prior state, starting fresh", "catalogId", id, "retired", entry.IsRetired())
+		if entry.IsRetired() {
+			s.log.DebugContext(ctx, "catalogstore: catalog already retired, returning tombstone state", "catalogId", id, "entryVersion", entry.EntryVersion)
+			result[id] = CatalogState{
+				EntryVersion: entry.EntryVersion,
+				CatalogType:  entry.CatalogType,
+				NetworkIds:   entry.NetworkIDs,
+				SchemaTypes:  entry.SchemaTypes,
+				Retired:      true,
+			}
+			continue
+		}
+		if entry.Baseline.URL == "" {
+			s.log.DebugContext(ctx, "catalogstore: no publishable prior state, starting fresh", "catalogId", id)
 			continue // no publishable prior state; caller starts a fresh baseline
 		}
 		state, err := s.reconstructState(ctx, entry)
