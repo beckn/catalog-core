@@ -149,9 +149,12 @@ const (
     ActionSkipUnchanged Action = "skip_unchanged"
     ActionRetire        Action = "retire"
     ActionRollback      Action = "rollback"
+    ActionRelisted      Action = "relisted" // a live entry for a catalog the caller has already retired
 )
 type Decision struct { Action Action; ToVersion, EntryVersion int64 }
-func DetectChange(entry CatalogEntry, entryCursor, contentCursor int64, seen bool) Decision
+type CursorState struct { Seen, Retired bool; EntryVersion, ContentVersion int64 }
+func Decide(entry CatalogEntry, c CursorState) Decision
+func DetectChange(entry CatalogEntry, entryCursor, contentCursor int64, seen bool) Decision // Decide without Retired
 
 func ResolveScope(entry CatalogEntry, callerNetworks []string) (take bool, visibleTo []string)
 ```
@@ -179,7 +182,10 @@ func ItemID(raw json.RawMessage) (string, error)
 
 type CatalogDiff struct { Resources, Offers DiffBlock }
 func Diff(prior, next json.RawMessage) (CatalogDiff, json.RawMessage, error)
+func RemovedAttributes(prior, next json.RawMessage) ([]string, error)
 ```
+
+A change file can set a top-level catalog attribute (`ChangeFileDoc.Catalog` is an overlay) but cannot remove one, so `Diff` says nothing about an attribute that `next` no longer has. `RemovedAttributes` lists them; a publisher that finds any has to publish a baseline instead of a change file (`publisher.Publish` does).
 
 **Catalog file document** (`filedoc.go`):
 
@@ -299,7 +305,7 @@ type Store interface {
 }
 ```
 
-Supporting types: `CatalogCursor`, `IndexCursor`, `PassReport`, `QueueItem` (`Op` is `"sync"` or `"retire"`), `ClaimedItem`.
+Supporting types: `CatalogCursor`, `IndexCursor`, `PassReport`, `QueueItem` (`Op` is `"sync"` or `"retire"`), `ClaimedItem`. A `Store` may also implement `PendingChecker` (`HasPending`), which lets `PollIndexes` queue a retire for a catalog whose first sync is still under way.
 
 ### `pkg/catalog/publisher`
 
@@ -308,22 +314,26 @@ Publish-side orchestration: diffs new catalog content against prior state, signs
 ```go
 type Submission struct {
     CatalogID    string
-    CatalogType  string
+    CatalogType  string // "REGULAR" (default) or "MASTER"
     SchemaTypes  []string
     NetworkIds   []string
     Dependencies []catalog.MasterDependency
     CrawlHint    string
     Catalog      json.RawMessage
+    Directives   PublishDirectives
+}
+
+type PublishDirectives struct {
+    ForceBaseline bool // publish a new baseline whatever the diff says
+    Retire        bool // replace the entry with a tombstone; Catalog is ignored
 }
 
 type Params struct {
     Catalogs                       []Submission
     PriorState                     map[string]store.CatalogState
-    Retire                         []string
-    ForceBaseline                  bool
     CompactionChangeCountThreshold int
     CompactionSizeRatioThreshold   float64
-    Gzip                           bool
+    Gzip                           bool // baseline and change files; "latest" keeps the name it was first published under
     PublishLatest                  bool
     NextUpdateIn                   time.Duration
     PublicBaseURL                  string
@@ -339,7 +349,7 @@ type Outcome struct {
     Changed                      bool
     Digest                       string
     Mode                         string // "baseline" | "change" | "metadata" | "unchanged"
-    Content, LatestContent       json.RawMessage
+    Content, LatestContent       json.RawMessage // LatestContent only when this call writes the file
     LatestDigest                 string
 }
 
@@ -355,11 +365,33 @@ type Result struct {
     Publish     store.PublishRequest
     Reports     []Outcome
     Errors      []PublishError
+    Retired     []RetireReport // one per catalogId asked to be retired, already retired or not
+}
+
+type RetireReport struct {
+    CatalogID      string
+    EntryVersion   int64
+    RetiredAt      string
+    AlreadyRetired bool // the entry was a tombstone before this call; nothing was signed
+    Latest         []RetiredLatestFile // every "latest" file a consumer may hold a URL for
+}
+
+type RetiredLatestFile struct {
+    File       catalog.FileEntry
+    Compressed bool
+    Content    json.RawMessage
+    Written    bool // false: the blob store already held exactly this
 }
 
 func IndexURL(publicBaseURL string) string
 func Publish(ctx context.Context, p Params) (Result, error)
 ```
+
+What `Publish` decides for one submission:
+
+- **Mode.** No prior content, `ForceBaseline`, a compaction threshold, or a submission that drops a top-level attribute: `baseline`. Changed resources, offers or attributes: `change`. Only entry metadata changed (or the entry's `latest` reference): `metadata`. Otherwise `unchanged`, which means the signed entry is byte for byte the one already in the index.
+- **`latest`.** It keeps the file name it was first advertised under; `Gzip` applies to baseline and change files. A baseline or change rewrites it. An unchanged or metadata-only call leaves an intact file alone and rewrites one that is missing, damaged, carries `retiredAt` under a live entry, or was signed with another key.
+- **Retire.** The tombstone goes to the name the entry advertised and to every other `latest` file the blob store holds for the catalog. Retiring an already retired catalog signs nothing and rewrites a `latest` file that does not yet carry `retiredAt`.
 
 ### `pkg/catalog/store`
 
@@ -372,6 +404,14 @@ type BlobStore interface {
 }
 var ErrBlobNotFound = errors.New("catalogstore: blob not found")
 
+// Optional. With it, Publish is safe for any number of writers sharing the blob store.
+type ConditionalBlobStore interface {
+    BlobStore
+    GetVersioned(ctx context.Context, path string) (content []byte, version string, err error)
+    PutIfVersion(ctx context.Context, path string, content []byte, ifVersion string) (newVersion string, err error) // "" = only if absent
+}
+var ErrPreconditionFailed  // PutIfVersion: the blob is not at ifVersion; nothing written
+
 const IndexFilename = "becknCatalogs.index.json"
 func IndexPath() string
 func LocalName(catalogID string) string
@@ -381,9 +421,9 @@ func CatalogFilePath(catalogID string, version int64, suffix string, compressed 
 func LatestFilePath(catalogID string, compressed bool) string
 
 type CatalogState struct {
-    Catalog         json.RawMessage
+    Catalog         json.RawMessage     // baseline with the changes after it applied
     BaselineFile    *catalog.FileEntry
-    ChangeFiles     []catalog.FileEntry
+    ChangeFiles     []catalog.FileEntry // includes superseded ones still listed after a re-baseline; those are not applied
     EntryVersion    int64
     CatalogType     string
     NetworkIds      []string
@@ -391,18 +431,29 @@ type CatalogState struct {
     IsActive        bool
     Dependencies    []catalog.MasterDependency
     CrawlHint       string
-    LatestPublished bool
-    Retired         bool // entry is already a tombstone; only EntryVersion/CatalogType/NetworkIds/SchemaTypes are set
-    NameConflicts   []NameConflict // other index entries written under the same file names
-    Unreadable      string         // why the published files could not be read back; Catalog is nil
+    LatestPublished bool                // LatestFile != nil
+    LatestFile      *catalog.FileEntry  // the entry's own "latest" reference
+    StoredLatest    []LatestFileState   // every "latest" file in the blob store, under either name
+    Retired         bool                // the entry is a tombstone; no content
+    RetiredAt       string
+    SignedEntry     json.RawMessage     // the entry exactly as stored
+    NameConflicts   []NameConflict      // other index entries written under the same file names
+    Unreadable      string              // why the published files could not be read back; Catalog is nil
+    EntryMalformed  bool                // the index entry itself does not parse; cannot be published or retired
 }
 
-type NameConflict struct {
-    CatalogID string
-    Retired   bool
+type NameConflict struct { CatalogID string; Retired bool }
+type LatestFileState struct {
+    Compressed, Readable bool
+    Content    json.RawMessage
+    ServedSize int64
+    Version    int64
+    Catalog    json.RawMessage
+    RetiredAt  *time.Time
 }
 
-func (s CatalogState) Known() bool // the id has an index entry, live or retired
+func (s CatalogState) Known() bool                           // the id has an index entry, live or retired
+func (s CatalogState) Stored(compressed bool) *LatestFileState
 
 type FileWrite struct {
     Version       int64
@@ -415,6 +466,7 @@ type CatalogUpdate struct {
     CatalogID   string
     SignedEntry json.RawMessage
     Baseline, Change, Latest *FileWrite
+    LatestAlt   *FileWrite // a retirement's tombstone for the other "latest" name
 }
 
 type PublishRequest struct {
@@ -422,13 +474,31 @@ type PublishRequest struct {
     NextUpdate  *time.Time
     Updates     []CatalogUpdate
     Retirements []CatalogUpdate
+    Base        *Base // from LoadForPublish; nil merges whatever is there
 }
 
 func New(blobs BlobStore) *Store
 func (s *Store) WithLogger(logger *slog.Logger) *Store
+func (s *Store) WithRetryPolicy(p RetryPolicy) *Store
 func (s *Store) LoadCatalogs(ctx context.Context, catalogIDs []string) (map[string]CatalogState, error)
+func (s *Store) LoadForPublish(ctx context.Context, catalogIDs []string) (map[string]CatalogState, *Base, error)
 func (s *Store) Publish(ctx context.Context, req PublishRequest) error
+
+var ErrConflict            // a catalog of the request changed since its Base was loaded: load, recompute, publish again
+var ErrIndexBusy           // the index kept changing until the retries ran out: publish again
+var ErrCatalogIDNotAllowed // a new catalogId would be stored over another catalog's files
+var ErrIndexUnreadable     // the index file is empty or not an index; restore it
 ```
+
+**Writers.** Over a plain `BlobStore` there must be one writer: `Publish` reads the index, merges and writes it back. Over a `ConditionalBlobStore` the index write is a compare-and-swap, retried with the request merged again when another writer got in first, so any number of processes can publish to one blob store. Use `LoadForPublish` and pass its `Base` back: `Publish` then returns `ErrConflict`, with nothing committed, if another writer changed one of the request's catalogs (or took a new catalogId's file names) in between. A request with no updates and no retirements writes nothing.
+
+**Order of writes, and what a reader sees if the process dies between two of them.** Baseline and change files are always written before the index that lists them, so a listed file is never missing. `latest` is one file overwritten in place and can be out of step with the index for the moment between the two writes; if the process dies there, the next publish of that catalog (or a repeated retire) puts it right.
+
+| Store | Order |
+|---|---|
+| Plain | files, `latest`, index |
+| Conditional, update | files, index, `latest` |
+| Conditional, retire | `latest` tombstones, index |
 
 ### `pkg/security/artifactsigner`
 
@@ -461,14 +531,22 @@ func VerifyFileTuple(catalogID string, version int, url, digest string, validUnt
 
 **Building a crawler**: construct a `crawler.Client` and `crawler.KeySource`, wrap them in a `catalog.NewFetcher`, implement `crawlmanager.Source` (index discovery), `crawlmanager.Sink` (where resolved catalog content goes), and `crawlmanager.Store` (crawl-cursor persistence), then drive the loop with `crawlmanager.Params.PollIndexes` / `SyncNext`.
 
-**Building a publisher**: implement `store.BlobStore` over your storage backend, load prior state with `store.New(blobs).LoadCatalogs`, call `publisher.Publish` with your `Submission`s and signing key, then hand the resulting `Result.Publish` to `store.Store.Publish`.
+**Building a publisher**: implement `store.BlobStore` over your storage backend (and `store.ConditionalBlobStore` if more than one process will publish), load prior state with `store.New(blobs).LoadForPublish`, call `publisher.Publish` with your `Submission`s and signing key, set `Result.Publish.Base` to the `Base` you loaded, and hand `Result.Publish` to `store.Store.Publish`. On `store.ErrConflict`, start again from the load.
 
-**What a `catalogId` may do.** `publisher.Publish` decides this from the `PriorState` that `LoadCatalogs` returned, so always pass it. Each refusal is a per-catalog `PublishError`; the other catalogs in the call are unaffected, and nothing is signed or written for the refused one.
+**What a `catalogId` may do.** `publisher.Publish` decides this from the `PriorState` that `LoadForPublish` (or `LoadCatalogs`) returned, so always pass it. Each refusal is a per-catalog `PublishError`; the other catalogs in the call are unaffected, and nothing is signed or written for the refused one.
 
 | Index entry for the id | Publish | Retire |
 |---|---|---|
 | None | Published as a baseline at version 1, `entryVersion` 1. Refused (`validate`) if the id fails `store.ValidateCatalogID`, or if its file names already belong to another entry, live or retired, or to another new id in the same call. | Refused (`retire`, "catalog not found"). No tombstone is signed. |
-| Live (`isActive` true or false) | Change file, metadata-only update, new baseline (`ForceBaseline` or compaction) or no-op. `entryVersion` goes up by one unless nothing changed. Refused (`load`) if its published files cannot be read back, unless `ForceBaseline` is set. | Tombstone at `entryVersion` + 1; one final write to `latest` if it was published. |
-| Retired | Refused (`validate`): retirement is one-way, use a new `catalogId` (NFH-014 CON-TBD-05, CON-TBD-26). | No-op; the tombstone is left as it is. |
+| Live (`isActive` true or false) | Change file, metadata-only update, new baseline (`ForceBaseline`, compaction, or a dropped top-level attribute) or no-op. `entryVersion` goes up by one unless nothing changed. Refused (`load`) if its published files cannot be read back, unless `ForceBaseline` is set. | Tombstone at `entryVersion` + 1, and a final copy carrying `retiredAt` in every `latest` file of the catalog. If the content cannot be read back, that copy is built from the stored `latest`; with nothing to build it from the retire is refused (`retire`) and nothing is signed. |
+| Retired | Refused (`validate`): retirement is one-way, use a new `catalogId` (NFH-014 CON-TBD-05, CON-TBD-26). | Nothing is signed; a `latest` file that does not carry `retiredAt` yet is rewritten. |
+| Present but not parseable | Refused (`load`), also with `ForceBaseline`, until the index entry is repaired. | Refused (`retire`). |
 
 File names come from the id's last path segment (`store.LocalName`), so `a.example/CAT-1` and `b.example/CAT-1` cannot both be published by one publisher, and neither can `CAT-1` and `cat-1`. An id that is already in the index is never re-checked against the shape rules, so existing catalogs keep their ids, file names and URLs.
+
+**A retired `catalogId` stays retired, on both sides.** This is one rule (NFH-014 CON-TBD-05, CON-TBD-26), enforced where content is written and again where it is read:
+
+- `publisher.Publish` refuses a submission under a retired id. The tombstone, its `entryVersion` and every file of the retired catalog stay as they were.
+- `catalog.Decide` returns `ActionRelisted` for a live entry of a catalog the reader has already retired, and `crawlmanager` does not apply it: the catalog is not served again, whatever `entryVersion` the new entry carries. It needs `CursorState.Retired`, so a reader has to remember that it retired a catalog.
+
+So a publisher that needs the content back publishes it under a new `catalogId`; to take a catalog offline for a while, publish it with `isActive: false` instead of retiring it. A reader also retires on any validly signed tombstone, whatever its `entryVersion`, and never treats a catalog's absence from an index as retirement.
