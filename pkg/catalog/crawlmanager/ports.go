@@ -238,3 +238,18 @@ type Store interface {
 	// whether to surface this is each consumer's own call.
 	ListAbandoned(ctx context.Context) ([]AbandonedCatalog, error)
 }
+
+// PendingChecker is an optional Store capability: whether catalogID has a
+// queue item in any state (queued, claimed, parked, abandoned).
+//
+// PollIndexes uses it for one case. A tombstone for a catalog with no
+// stored cursor normally needs nothing done -- this reader never carried
+// it. But if the catalog's FIRST sync is queued or in flight, that sync may
+// already have read the index from before the retirement, and will deliver
+// the live content after this poll has looked at the tombstone and moved
+// on. A Store that implements PendingChecker lets PollIndexes enqueue the
+// retire in exactly that case, so it runs once the sync has settled. A
+// Store that does not implement it keeps the previous behaviour.
+type PendingChecker interface {
+	HasPending(ctx context.Context, catalogID string) (bool, error)
+}

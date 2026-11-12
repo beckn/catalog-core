@@ -29,6 +29,9 @@ type CatalogDiff struct {
 // window") without having to special-case each one. changeCatalog is nil
 // when no catalog-level attributes changed. The result feeds a change
 // file's own shape (ChangeFileDoc's Resources/Offers/Catalog) directly.
+//
+// A top-level field that prior has and next does not is not part of the
+// result: see RemovedAttributes.
 func Diff(prior, next json.RawMessage) (CatalogDiff, json.RawMessage, error) {
 	var priorFields, nextFields map[string]json.RawMessage
 	if err := json.Unmarshal(prior, &priorFields); err != nil {
@@ -137,6 +140,38 @@ func diffCatalogAttributes(priorFields, nextFields map[string]json.RawMessage) j
 	// back out cannot fail.
 	raw, _ := json.Marshal(changed)
 	return raw
+}
+
+// RemovedAttributes returns the top-level catalog fields that prior has
+// and next does not, sorted -- leaving out "id", "resources" and "offers",
+// as diffCatalogAttributes does.
+//
+// A change file cannot express this. Its "catalog" member is an overlay of
+// fields to set (Apply copies each one onto the catalog), and the file
+// format defines no way to say "this field is gone". Diff therefore says
+// nothing about a removed field, and a caller that published only what
+// Diff returns would leave the field in what a consumer reconstructs. A
+// caller that finds a removed attribute has to publish a full baseline
+// instead (pkg/catalog/publisher does).
+func RemovedAttributes(prior, next json.RawMessage) ([]string, error) {
+	var priorFields, nextFields map[string]json.RawMessage
+	if err := json.Unmarshal(prior, &priorFields); err != nil {
+		return nil, fmt.Errorf("catalog: parsing prior catalog: %w", err)
+	}
+	if err := json.Unmarshal(next, &nextFields); err != nil {
+		return nil, fmt.Errorf("catalog: parsing submitted catalog: %w", err)
+	}
+	var removed []string
+	for field := range priorFields {
+		if catalogAttributeFieldsToSkip[field] {
+			continue
+		}
+		if _, ok := nextFields[field]; !ok {
+			removed = append(removed, field)
+		}
+	}
+	sort.Strings(removed)
+	return removed, nil
 }
 
 // jsonEqual compares two JSON values semantically (decoded structure, not
