@@ -254,7 +254,19 @@ func (p Params) decideCatalog(ctx context.Context, ref IndexRef, entry catalog.C
 		return nil
 	case catalog.ActionRetire:
 		if !seen {
-			return nil // never had it; nothing to retire
+			// Never had it: nothing to retire -- unless its first sync is
+			// still pending and about to deliver it (see PendingChecker).
+			pc, ok := p.Store.(PendingChecker)
+			if !ok {
+				return nil
+			}
+			pending, err := pc.HasPending(ctx, entry.CatalogID)
+			if err != nil {
+				return fmt.Errorf("checking pending work: %w", err)
+			}
+			if !pending {
+				return nil
+			}
 		}
 		if err := p.Store.Enqueue(ctx, QueueItem{CatalogID: entry.CatalogID, IndexURL: ref.IndexURL, ParticipantID: ref.ParticipantID, Op: OpRetire}); err != nil {
 			return err

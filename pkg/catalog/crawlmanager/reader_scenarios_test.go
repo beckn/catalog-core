@@ -365,6 +365,54 @@ func TestReader_TombstoneNeverSeen_IsIgnored(t *testing.T) {
 	}
 }
 
+// The catalog's first sync is queued when the publisher retires it. With no
+// cursor yet the tombstone alone asks for nothing, but the queued sync must
+// not leave the catalog served: the retire is queued behind it.
+func TestReader_RetiredWhileFirstSyncPending_Retires(t *testing.T) {
+	r := newReaderRig(t)
+	r.p.Store = pendingStore{r.store}
+	r.pub.setLive(catA, 1, 1, "live-v1")
+	r.poll() // first sync queued, not yet run
+
+	// The sync resolved the live index; the tombstone lands, and a poll
+	// sees it, before the sync settles.
+	item, err := r.store.ClaimNext(context.Background())
+	if err != nil || item == nil {
+		t.Fatalf("claim: %v %v", item, err)
+	}
+	r.pub.setTombstone(catA, 2, "2026-11-12T10:00:00Z")
+	r.poll()
+	// The in-flight sync settles with the live content it had resolved.
+	r.sink.Send(context.Background(), catalog.CatalogEntry{CatalogID: catA}, []byte(`{"descriptor":{"name":"live-v1"},"resources":[{"id":"r1"}]}`)) //nolint:errcheck
+	if err := r.store.Complete(context.Background(), item.ID, item.ClaimID, crawlmanager.CatalogCursor{
+		CatalogID: catA, IndexURL: item.IndexURL, Version: 1, EntryVersion: 1, Descriptor: json.RawMessage(`{"name":"live-v1"}`),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r.drain()
+	r.wantHistory(catA, "live-v1,WIPE")
+	r.wantRetired(catA, true)
+}
+
+// pendingStore adds crawlmanager.PendingChecker to the fake store.
+type pendingStore struct{ *fakeStore }
+
+func (s pendingStore) HasPending(_ context.Context, catalogID string) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, it := range s.queue {
+		if it.CatalogID == catalogID {
+			return true, nil
+		}
+	}
+	for _, it := range s.claimed {
+		if it.CatalogID == catalogID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // A tombstone that does not verify is not a tombstone: an attacker who can
 // serve the index must not be able to retire someone's catalog.
 func TestReader_ForgedTombstone_DoesNotRetire(t *testing.T) {
